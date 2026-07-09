@@ -1,0 +1,15 @@
+{
+  // Test-only TypeScript config used by ts-jest.
+  // The app build (tsconfig.json) targets NodeNext/CommonJS emit and excludes *.test.ts;
+  // Jest runs in a CommonJS sandbox, so we compile tests to plain CommonJS with classic
+  // Node resolution and pull in the jest global types.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "types": ["node", "jest"],
+    "noEmit": false,
+    "sourceMap": true
+  },
+  "include": ["src/**/*.ts"]
+}

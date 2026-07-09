@@ -1,0 +1,36 @@
+{
+  "name": "corespecialty-helpdesk-automation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "clean": "rimraf build",
+    "build": "npm install && npm ci && npm run clean && tsc -p tsconfig.json",
+    "watch": "tsc -p tsconfig.json -w",
+    "lint": "eslint \"src/**/*.ts\"",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "dependencies": {
+    "@azure/functions": "4.11.2",
+    "@azure/identity": "4.13.1",
+    "axios": "1.18.0"
+  },
+  "devDependencies": {
+    "@types/jest": "30.0.0",
+    "@types/node": "24.0.0",
+    "@typescript-eslint/eslint-plugin": "8.0.0",
+    "@typescript-eslint/parser": "8.0.0",
+    "axios-mock-adapter": "2.1.0",
+    "eslint": "9.0.0",
+    "jest": "30.4.2",
+    "rimraf": "6.1.2",
+    "ts-jest": "29.4.11",
+    "typescript": "5.4.5"
+  },
+  "main": "build/index.js"
+}
