@@ -19,8 +19,24 @@ export function safeJson(v: any): string {
   }
 }
 
+// The API's own error body is the only thing that explains a 4xx (e.g. Helpdesk's 422 on
+// POST /agents). The Functions host logs an object with util.inspect's default depth of 2, so a
+// nested body renders as the useless `responseData: { error: [Object] }` — the reason is dropped
+// exactly when it's needed. Serialize it to a string so it always survives at any depth. Cap it so
+// a large HTML error page can't flood the log stream.
+const MAX_RESPONSE_DATA_CHARS = 2000;
+
+function formatResponseData(data: unknown): string | undefined {
+  if (data === undefined || data === null) return undefined;
+  const s = safeJson(data);
+  return s.length > MAX_RESPONSE_DATA_CHARS
+    ? `${s.slice(0, MAX_RESPONSE_DATA_CHARS)}…[truncated ${s.length - MAX_RESPONSE_DATA_CHARS} chars]`
+    : s;
+}
+
 /**
- * Normalize an Axios/Error into a compact, log-friendly object.
+ * Normalize an Axios/Error into a compact, log-friendly object. `responseData` is a JSON *string*
+ * (not the raw object) so the host's depth-limited inspect can never elide the server's reason.
  */
 export function formatAxiosError(e: any): any {
   const ax = e as AxiosError;
@@ -32,7 +48,7 @@ export function formatAxiosError(e: any): any {
     statusText: ax?.response?.statusText,
     url: (ax as any)?.config?.url,
     method: (ax as any)?.config?.method,
-    responseData: ax?.response?.data,
+    responseData: formatResponseData(ax?.response?.data),
   };
 }
 

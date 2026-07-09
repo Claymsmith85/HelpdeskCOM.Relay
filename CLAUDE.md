@@ -76,6 +76,12 @@ Other behavioral invariants worth preserving:
 
 ## Accessing logs (Application Insights)
 
+> ⛔ **This working copy has no live connection.** Do **not** attempt `az monitor app-insights query`,
+> `az functionapp …`, or any other live Azure/Helpdesk call from this environment — there is no
+> network path or credential, so the calls only waste a turn. Diagnose from the source, the tests,
+> and log excerpts the user pastes in. Everything below is reference material for someone working
+> from a machine that *does* have access.
+
 Runtime logs (the `createStepLogger` traces, host status, exceptions, request/dependency telemetry) live in **Application Insights**, queried with `az monitor app-insights query`. Two environment gotchas bite every time:
 
 - **Zscaler cert split.** The data-plane endpoint (`api.applicationinsights.io`) is TLS-intercepted by Zscaler, so `az monitor app-insights query` needs `REQUESTS_CA_BUNDLE` pointing at the Zscaler root (`%USERPROFILE%\Zscaler Root.cer`, the same file as the npm `cafile` / `NODE_EXTRA_CA_CERTS`). But ARM calls (`az account`, `az resource list`, `az functionapp …`) **fail** if it's set — `unset` it for those. Empty-string counts as "set to an invalid path", so use `unset`, not `REQUESTS_CA_BUNDLE=`.

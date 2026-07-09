@@ -462,7 +462,14 @@ export async function runTeamSync(
       });
     } catch (e) {
       failed++;
-      log?.("Team sync: invite FAILED", { email: inv.email, error: formatAxiosError(e) });
+      // Log what we SENT alongside the rejection: a 4xx from POST /agents is a semantic rejection
+      // (e.g. the email already exists, or a seat limit), so the payload is half the diagnosis.
+      log?.("Team sync: invite FAILED", {
+        email: inv.email,
+        roles: inv.roles,
+        teamIDs: inv.teamIDs,
+        error: formatAxiosError(e),
+      });
     }
   }
 
