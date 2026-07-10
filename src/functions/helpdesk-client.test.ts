@@ -124,7 +124,7 @@ describe("agent / team operations", () => {
     expect(await listTeams(helpdesk)).toEqual([{ ID: "T1", name: "Escape" }]);
   });
 
-  it("inviteAgent posts roles/teamIDs/status and returns the new ID", async () => {
+  it("inviteAgent posts email/name/roles/teamIDs — and never `status` — and returns the new ID", async () => {
     mock.onPost("/agents").reply(200, { ID: "a9" });
     const id = await inviteAgent({
       helpdesk,
@@ -136,9 +136,12 @@ describe("agent / team operations", () => {
     expect(id).toBe("a9");
     const body = JSON.parse(mock.history.post[0].data);
     expect(body.email).toBe("new@x.com");
+    expect(body.name).toBe("New Person");
     expect(body.roles).toEqual(["normal"]);
     expect(body.teamIDs).toEqual(["T1", "T2"]);
-    expect(body.status).toBe("invited"); // default
+    // Helpdesk's create schema rejects a `status` key outright (422 `"status" is not allowed`),
+    // so it must not reach the wire — asserted on the serialized body, not just the TS type.
+    expect(body).not.toHaveProperty("status");
   });
 
   it("inviteAgent throws when no ID is returned", async () => {

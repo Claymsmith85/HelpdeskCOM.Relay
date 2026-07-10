@@ -159,8 +159,11 @@ export async function listTeams(helpdesk: AxiosInstance): Promise<HelpdeskTeam[]
 }
 
 /**
- * Invite/create an agent into the given team(s); returns the new agent ID. New agents default to
- * status "invited" (Helpdesk sends them the invite) — override via `status`.
+ * Invite/create an agent into the given team(s); returns the new agent ID. The new agent lands in
+ * Helpdesk's default "invited" state (Helpdesk sends them the invite).
+ *
+ * Do NOT add `status` to this body: the create schema rejects the key outright with a 422
+ * (`"status" is not allowed`), despite the public docs listing it as an optional property.
  */
 export async function inviteAgent(opts: {
   helpdesk: AxiosInstance;
@@ -168,12 +171,11 @@ export async function inviteAgent(opts: {
   name: string;
   roles: string[];
   teamIDs: string[];
-  status?: string;
 }): Promise<string> {
-  const { helpdesk, email, name, roles, teamIDs, status } = opts;
+  const { helpdesk, email, name, roles, teamIDs } = opts;
   const res = await helpdesk.post(
     "/agents",
-    { email, name, roles, teamIDs, status: status ?? "invited" },
+    { email, name, roles, teamIDs },
     { headers: { "Content-Type": "application/json" } }
   );
   const id: string | undefined = (res.data && (res.data.ID ?? res.data.id)) as string | undefined;

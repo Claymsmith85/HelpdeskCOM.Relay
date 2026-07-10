@@ -287,7 +287,6 @@ describe("runTeamSync (orchestration)", () => {
     ],
     maxRemovals: 5,
     defaultRole: "normal",
-    inviteStatus: "invited",
     dryRun: false,
     cleanupOrphans: false,
     protectedEmails: new Set<string>(),
@@ -343,8 +342,10 @@ describe("runTeamSync (orchestration)", () => {
     const invites = hmock.history.post.map((p) => JSON.parse(p.data));
     const viewer = invites.find((i) => i.email === "newviewer@x.com");
     const newAgent = invites.find((i) => i.email === "newagent@x.com");
-    expect(viewer).toMatchObject({ roles: ["viewer"], teamIDs: [], status: "invited" });
+    expect(viewer).toMatchObject({ roles: ["viewer"], teamIDs: [] });
     expect(newAgent).toMatchObject({ roles: ["normal"], teamIDs: ["T1"] });
+    // Helpdesk 422s on a `status` key in the create body — no invite may carry one.
+    for (const inv of invites) expect(inv).not.toHaveProperty("status");
     expect(hmock.history.delete[0].url).toBe("/agents/a-gone");
   });
 

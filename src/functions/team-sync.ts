@@ -43,7 +43,6 @@ export type TeamSyncOptions = {
   rules: GroupRule[]; // group->team/role mapping (hardcoded in team-mapping.ts)
   maxRemovals: number;
   defaultRole: string; // role used when a rule omits one
-  inviteStatus: string;
   dryRun: boolean;
   cleanupOrphans: boolean; // also reap PRE-EXISTING agents in no mapped group with zero teams
   protectedEmails: Set<string>; // emails (lowercased) never deleted — owner / break-glass admins
@@ -70,7 +69,6 @@ export function teamSyncOptionsFromEnv(): TeamSyncOptions {
     rules: rulesForEnvironment(process.env.RELAY_ENVIRONMENT),
     maxRemovals: envPositiveNumber(process.env.TEAM_SYNC_MAX_REMOVALS, 5, { integer: true }),
     defaultRole: (process.env.TEAM_SYNC_DEFAULT_ROLE ?? "normal").trim() || "normal",
-    inviteStatus: (process.env.TEAM_SYNC_INVITE_STATUS ?? "invited").trim() || "invited",
     dryRun: (process.env.TEAM_SYNC_DRY_RUN ?? "").trim().toLowerCase() === "true",
     // Default ON: decommission fully-orphaned agents (in no mapped group AND zero teams). Set
     // TEAM_SYNC_CLEANUP_ORPHANS=false to fall back to only deleting agents whose last mapped team
@@ -451,7 +449,6 @@ export async function runTeamSync(
         name: inv.name,
         roles: inv.roles,
         teamIDs: inv.teamIDs,
-        status: opts.inviteStatus,
       });
       summary.invited++;
       log?.("Team sync: agent invited", {
