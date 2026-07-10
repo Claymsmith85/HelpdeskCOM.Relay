@@ -1,6 +1,14 @@
 // Tests for team-sync.ts: the rule parser, role collapsing, the pure reconciler planTeamSync (the
 // crux), and the runTeamSync orchestration (Graph + Helpdesk mocked with axios-mock-adapter on
 // injected clients). No @azure/functions side effects — the timer lives in sync-teams.ts.
+
+// The seat-limit alert has its own suite (seat-alert.test.ts); here we only assert runTeamSync
+// WIRES it up, so the send is stubbed while the real seatLimitFromError still classifies the error.
+jest.mock("./seat-alert", () => ({
+  ...jest.requireActual("./seat-alert"),
+  sendSeatLimitAlert: jest.fn().mockResolvedValue("sent"),
+}));
+
 import axios from "axios";
 import MockAdapter from "axios-mock-adapter";
 import {
@@ -12,6 +20,7 @@ import {
   TeamSyncOptions,
 } from "./team-sync";
 import { HelpdeskAgent } from "./helpdesk-client";
+import { sendSeatLimitAlert } from "./seat-alert";
 
 // ---- helpers ----
 
@@ -297,6 +306,7 @@ describe("runTeamSync (orchestration)", () => {
     helpdesk = axios.create();
     gmock = new MockAdapter(graph);
     hmock = new MockAdapter(helpdesk);
+    (sendSeatLimitAlert as jest.Mock).mockClear().mockResolvedValue("sent");
   });
   afterEach(() => {
     gmock.restore();
@@ -347,6 +357,75 @@ describe("runTeamSync (orchestration)", () => {
     // Helpdesk 422s on a `status` key in the create body — no invite may carry one.
     for (const inv of invites) expect(inv).not.toHaveProperty("status");
     expect(hmock.history.delete[0].url).toBe("/agents/a-gone");
+  });
+
+  // The production 409 body (July 2026), verbatim.
+  const SEAT_409 = {
+    error: {
+      type: "limitExceeded",
+      message: "agents count (15) is greater than subscription allows (14)",
+      details: { paymentMethod: "manual", lackingSeats: 1 },
+    },
+  };
+
+  it("alerts management once when invites are rejected for want of agent licenses", async () => {
+    mockGroups({
+      G1: [
+        { id: "1", displayName: "Jayvid Parra", mail: "jayvid.parra@x.com", accountEnabled: true },
+        { id: "2", displayName: "Second New", mail: "second@x.com", accountEnabled: true },
+      ],
+      GV: [],
+    });
+    hmock.onGet("/agents").reply(200, [
+      { ID: "a-boss", email: "boss@x.com", roles: ["normal"], teamIDs: ["MGMT"], status: "active" },
+    ]);
+    hmock.onPost("/agents").reply(409, SEAT_409);
+
+    const withMgmt = { ...opts, managementTeamId: "MGMT", environment: "Production" };
+    // Invite failures still fail the run — the alert informs, it does not absolve.
+    await expect(runTeamSync(graph, helpdesk, withMgmt)).rejects.toThrow(/2 change\(s\)/);
+
+    // ONE alert naming BOTH blocked users, not one per failed invite.
+    expect(sendSeatLimitAlert).toHaveBeenCalledTimes(1);
+    const arg = (sendSeatLimitAlert as jest.Mock).mock.calls[0][0];
+    expect(arg.managementTeamId).toBe("MGMT");
+    expect(arg.environment).toBe("Production");
+    expect(arg.info).toEqual({
+      message: "agents count (15) is greater than subscription allows (14)",
+      lackingSeats: 1,
+    });
+    expect(arg.blocked.map((b: any) => b.email).sort()).toEqual([
+      "jayvid.parra@x.com",
+      "second@x.com",
+    ]);
+    // The agent list is passed through so the alert can resolve the management team's members.
+    expect(arg.agents).toHaveLength(1);
+  });
+
+  it("does not alert when an invite fails for a NON-seat reason (e.g. duplicate email)", async () => {
+    mockGroups({ G1: [{ id: "1", displayName: "New", mail: "new@x.com", accountEnabled: true }], GV: [] });
+    hmock.onGet("/agents").reply(200, []);
+    hmock
+      .onPost("/agents")
+      .reply(409, { error: { type: "conflict", message: "agent with this email already exists" } });
+
+    await expect(
+      runTeamSync(graph, helpdesk, { ...opts, managementTeamId: "MGMT" })
+    ).rejects.toThrow(/1 change\(s\)/);
+    expect(sendSeatLimitAlert).not.toHaveBeenCalled();
+  });
+
+  it("a failing alert never changes the sync's own outcome", async () => {
+    (sendSeatLimitAlert as jest.Mock).mockRejectedValueOnce(new Error("storage down"));
+    mockGroups({ G1: [{ id: "1", displayName: "New", mail: "new@x.com", accountEnabled: true }], GV: [] });
+    hmock.onGet("/agents").reply(200, []);
+    hmock.onPost("/agents").reply(409, SEAT_409);
+
+    // Still the invite-failure error, not the alert's — and `seatLimited` is not lost.
+    await expect(
+      runTeamSync(graph, helpdesk, { ...opts, managementTeamId: "MGMT" })
+    ).rejects.toThrow(/1 change\(s\)/);
+    expect(sendSeatLimitAlert).toHaveBeenCalledTimes(1);
   });
 
   it("suppresses removals when a team group reads empty (no delete despite a stale agent)", async () => {

@@ -39,6 +39,19 @@ export const RULES_BY_ENV: Record<string, GroupRule[]> = {
   ],
 };
 
+// The Helpdesk team whose members are emailed when an invite is rejected for want of an agent
+// license (see seat-alert.ts). Deliberately keyed off the same per-environment table above: the
+// recipients are the agents Helpdesk already has on this team, so the alert reaches the people who
+// can buy seats.
+//
+// `undefined` = no management team mapped for that environment => NO alert mail is sent there (the
+// seat-limit condition is still logged at ERROR). Development is intentionally undefined: it has no
+// Mgmt. Team rule, and Dev must never mail Production's managers.
+export const MANAGEMENT_TEAM_BY_ENV: Record<string, string | undefined> = {
+  Production: "4533d6c2-98fc-4563-855a-c5205f4c856d", // Mgmt. Team (see the Production rule above)
+  Development: undefined,
+};
+
 // Default when RELAY_ENVIRONMENT is unset/unknown. MUST be the least-privileged table (never
 // Production), so an unconfigured deploy can't run Production's destructive reconcile.
 export const DEFAULT_ENVIRONMENT = "Development";
@@ -50,4 +63,16 @@ export const DEFAULT_ENVIRONMENT = "Development";
 export function rulesForEnvironment(envName: string | undefined): GroupRule[] {
   const key = (envName ?? "").trim();
   return RULES_BY_ENV[key] ?? RULES_BY_ENV[DEFAULT_ENVIRONMENT] ?? [];
+}
+
+/**
+ * Resolve the Helpdesk team to notify about exhausted agent licenses. Mirrors
+ * `rulesForEnvironment`'s fallback: an unset/unknown environment resolves to the Development table,
+ * which has no management team — so an unconfigured deploy sends no alert mail rather than mailing
+ * Production's managers.
+ */
+export function managementTeamForEnvironment(envName: string | undefined): string | undefined {
+  const key = (envName ?? "").trim();
+  const known = Object.prototype.hasOwnProperty.call(MANAGEMENT_TEAM_BY_ENV, key);
+  return known ? MANAGEMENT_TEAM_BY_ENV[key] : MANAGEMENT_TEAM_BY_ENV[DEFAULT_ENVIRONMENT];
 }

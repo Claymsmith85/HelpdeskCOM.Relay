@@ -32,10 +32,9 @@
 //     reverts to the old unlocked behavior if the lock ever misbehaves in production.
 //   - Crash mid-drain: the renewal timer dies with the process, so the lease expires on its own
 //     within DRAIN_LOCK_LEASE_SECONDS and the next trigger re-acquires. Nothing deadlocks.
-import axios, { AxiosError, AxiosInstance } from "axios";
+import { AxiosError, AxiosInstance } from "axios";
 import { randomUUID } from "node:crypto";
-import { DefaultAzureCredential } from "@azure/identity";
-import { attachRetryInterceptor } from "./http-retry";
+import { buildStorageClient as buildSharedStorageClient } from "./storage-client";
 import { envPositiveNumber } from "./env";
 
 // #region Configuration (read once at load)
@@ -64,10 +63,6 @@ const RENEW_MS = envPositiveNumber(process.env.DRAIN_LOCK_RENEW_MS, 25_000, { in
 const ACQUIRE_WAIT_MS = envPositiveNumber(process.env.DRAIN_LOCK_ACQUIRE_WAIT_MS, 30_000, { integer: true });
 const ACQUIRE_POLL_MS = envPositiveNumber(process.env.DRAIN_LOCK_ACQUIRE_POLL_MS, 3_000, { integer: true });
 const HTTP_TIMEOUT_MS = envPositiveNumber(process.env.DRAIN_LOCK_HTTP_TIMEOUT_MS, 30_000, { integer: true });
-
-// Storage REST API version. Lease semantics are stable across versions; this is just a recent one.
-const STORAGE_API_VERSION = "2023-11-03";
-const STORAGE_SCOPE = "https://storage.azure.com/.default";
 
 // #endregion
 
@@ -284,48 +279,13 @@ function startRenewal(
   return () => timer.clear();
 }
 
-/**
- * Build the storage REST client: baseURL = the blob service endpoint, app-only bearer token from
- * the user-assigned managed identity (the same identity the runtime uses for AzureWebJobsStorage),
- * and the required x-ms-version / x-ms-date headers. Built per acquire (tokens are long-lived; the
- * cost is one cached-credential call).
- */
+/** The storage REST client, authenticated as the UAMI. Shared with seat-alert.ts. */
 async function buildStorageClient(): Promise<AxiosInstance> {
-  const account =
-    process.env.AzureWebJobsStorage__accountName ?? process.env.DRAIN_LOCK_ACCOUNT_NAME;
-  const serviceUri =
-    process.env.AzureWebJobsStorage__blobServiceUri ??
-    (account ? `https://${account}.blob.core.windows.net` : undefined);
-  if (!serviceUri) {
-    throw new Error(
-      "drain-lock: storage account not configured (set AzureWebJobsStorage__accountName or AzureWebJobsStorage__blobServiceUri)"
-    );
-  }
-
-  // The UAMI used for identity-based AzureWebJobsStorage (falls back to the relay's MI client id).
-  const clientId =
-    process.env.AzureWebJobsStorage__clientId ?? process.env.MANAGED_IDENTITY_CLIENT_ID;
-  const cred = new DefaultAzureCredential(
-    clientId ? { managedIdentityClientId: clientId } : undefined
-  );
-  const token = await cred.getToken(STORAGE_SCOPE);
-  if (!token?.token) throw new Error("drain-lock: failed to acquire storage token");
-
-  const client = axios.create({
-    baseURL: serviceUri,
-    timeout: HTTP_TIMEOUT_MS,
-    headers: {
-      Authorization: `Bearer ${token.token}`,
-      "x-ms-version": STORAGE_API_VERSION,
-    },
+  return buildSharedStorageClient({
+    timeoutMs: HTTP_TIMEOUT_MS,
+    errorPrefix: "drain-lock",
+    accountName: process.env.DRAIN_LOCK_ACCOUNT_NAME,
   });
-  // Stamp a fresh x-ms-date per request (storage requires it; the client outlives a single call
-  // because the renewal timer reuses it for up to the whole drain).
-  client.interceptors.request.use((cfg) => {
-    cfg.headers.set("x-ms-date", new Date().toUTCString());
-    return cfg;
-  });
-  return attachRetryInterceptor(client);
 }
 
 function errInfo(e: unknown): { status?: number; message: string } {

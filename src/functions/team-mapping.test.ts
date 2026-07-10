@@ -2,7 +2,13 @@
 // A typo'd or duplicated GUID, a missing role, or a team-less agent rule would silently
 // mis-provision agents, so assert each environment table's structural invariants here — plus the
 // safe-default behavior of the environment resolver.
-import { RULES_BY_ENV, rulesForEnvironment, GroupRule } from "./team-mapping";
+import {
+  MANAGEMENT_TEAM_BY_ENV,
+  RULES_BY_ENV,
+  GroupRule,
+  managementTeamForEnvironment,
+  rulesForEnvironment,
+} from "./team-mapping";
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -45,5 +51,28 @@ describe("rulesForEnvironment", () => {
     expect(rulesForEnvironment(undefined)).toBe(RULES_BY_ENV.Development);
     expect(rulesForEnvironment("")).toBe(RULES_BY_ENV.Development);
     expect(rulesForEnvironment("Staging")).toBe(RULES_BY_ENV.Development);
+  });
+});
+
+describe("managementTeamForEnvironment", () => {
+  it("Production's management team is a GUID, and is a team Production actually maps", () => {
+    const team = managementTeamForEnvironment("Production");
+    expect(team).toMatch(GUID);
+    expect(RULES_BY_ENV.Production.map((r) => r.team)).toContain(team);
+  });
+
+  it("no environment other than Production may mail managers", () => {
+    // The seat alert mails whoever is on this team. Dev shares the Helpdesk account with Prod, so a
+    // Dev-mapped management team would mail Production's managers from the Dev app.
+    expect(managementTeamForEnvironment("Development")).toBeUndefined();
+    for (const [env, team] of Object.entries(MANAGEMENT_TEAM_BY_ENV)) {
+      if (env !== "Production") expect(team).toBeUndefined();
+    }
+  });
+
+  it("an unset/unknown environment sends no alert (falls back to Development)", () => {
+    expect(managementTeamForEnvironment(undefined)).toBeUndefined();
+    expect(managementTeamForEnvironment("")).toBeUndefined();
+    expect(managementTeamForEnvironment("Staging")).toBeUndefined();
   });
 });
