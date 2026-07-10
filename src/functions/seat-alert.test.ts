@@ -1,8 +1,7 @@
-// Unit tests for the once-daily "Helpdesk is out of agent licenses" alert (seat-alert.ts).
-//
-// The storage REST boundary is mocked with axios-mock-adapter on an injected axios instance
-// (opts.client), so no real Storage account or credential is needed — the same seam drain-lock.ts
-// uses. Graph's sendMail is mocked at the module boundary.
+// Unit tests for the seat-limit (licensing) alert definition (seat-alert.ts). The engine it sits
+// on — routing, throttle, recipients, kill switches — has its own suite (alerts.test.ts); here we
+// pin the CLASSIFIER (seatLimitFromError), the mail content, and the definition-to-engine wiring
+// by driving sendSeatLimitAlert through the REAL engine with an injected storage client.
 
 jest.mock("@azure/identity", () => ({
   DefaultAzureCredential: jest.fn().mockImplementation(() => ({
@@ -15,19 +14,10 @@ import axios, { AxiosInstance } from "axios";
 import MockAdapter from "axios-mock-adapter";
 import { sendMailViaGraph } from "./graph-mail";
 import { HelpdeskAgent } from "./helpdesk-client";
-import {
-  SEAT_ALERT_FROM_MAILBOX,
-  alertDateKey,
-  claimDailyAlert,
-  seatAlertBlobName,
-  seatAlertRecipients,
-  seatAlertSubject,
-  seatLimitFromError,
-  sendSeatLimitAlert,
-} from "./seat-alert";
+import { ALERT_TEAMS_BY_ENV } from "./team-mapping";
+import { seatAlertBody, seatAlertSubject, seatLimitFromError, sendSeatLimitAlert } from "./seat-alert";
 
-const MGMT = "4533d6c2-98fc-4563-855a-c5205f4c856d";
-const CONTAINER = "/relay-state?restype=container";
+const LICENSING_PROD = ALERT_TEAMS_BY_ENV.Production.licensing!;
 const graph = {} as AxiosInstance;
 
 /** The exact 409 body Helpdesk returned in production (July 2026). */
@@ -41,10 +31,6 @@ const SEAT_409 = {
 
 function axiosErr(status: number, data: unknown): any {
   return { isAxiosError: true, response: { status, data } };
-}
-
-function agent(email: string, teamIDs: string[]): HelpdeskAgent {
-  return { ID: `id-${email}`, email, roles: ["normal"], teamIDs };
 }
 
 let client: AxiosInstance;
@@ -101,68 +87,6 @@ describe("seatLimitFromError", () => {
   });
 });
 
-describe("alertDateKey", () => {
-  it("keys on the Eastern business day, not UTC", () => {
-    // 02:00 UTC on Jul 11 is still 22:00 ET on Jul 10 — the alert belongs to the 10th.
-    expect(alertDateKey(new Date("2026-07-11T02:00:00Z"))).toBe("2026-07-10");
-    expect(alertDateKey(new Date("2026-07-11T12:00:00Z"))).toBe("2026-07-11");
-  });
-});
-
-describe("seatAlertBlobName", () => {
-  it("is per-environment and per-day, on a safe blob charset", () => {
-    expect(seatAlertBlobName("Production", "2026-07-10")).toBe("seat-alert-production-2026-07-10");
-    expect(seatAlertBlobName(undefined, "2026-07-10")).toBe("seat-alert-unknown-2026-07-10");
-    expect(seatAlertBlobName("Dev/Test", "2026-07-10")).toBe("seat-alert-dev-test-2026-07-10");
-  });
-});
-
-describe("claimDailyAlert", () => {
-  it("claims the day on first PUT (create-if-absent)", async () => {
-    mock.onPut(CONTAINER).reply(201);
-    mock.onPut(/\/relay-state\/seat-alert/).reply(201);
-    await expect(claimDailyAlert(client, "seat-alert-production-2026-07-10", "{}")).resolves.toBe(true);
-    const put = mock.history.put.find((p) => p.url?.includes("seat-alert"))!;
-    expect(put.headers?.["If-None-Match"]).toBe("*");
-  });
-
-  it("tolerates an already-existing container", async () => {
-    mock.onPut(CONTAINER).reply(409);
-    mock.onPut(/\/relay-state\/seat-alert/).reply(201);
-    await expect(claimDailyAlert(client, "seat-alert-x", "{}")).resolves.toBe(true);
-  });
-
-  it.each([409, 412])("returns false when the blob already exists (%i)", async (status) => {
-    mock.onPut(CONTAINER).reply(201);
-    mock.onPut(/\/relay-state\/seat-alert/).reply(status);
-    await expect(claimDailyAlert(client, "seat-alert-x", "{}")).resolves.toBe(false);
-  });
-
-  it("throws on any other storage failure (fail-closed: no mail rather than hourly mail)", async () => {
-    mock.onPut(CONTAINER).reply(201);
-    mock.onPut(/\/relay-state\/seat-alert/).reply(403);
-    await expect(claimDailyAlert(client, "seat-alert-x", "{}")).rejects.toMatchObject({
-      response: { status: 403 },
-    });
-  });
-});
-
-describe("seatAlertRecipients", () => {
-  it("selects management-team agents, dedupes, and skips our own drain mailboxes", () => {
-    const agents = [
-      agent("boss@corespecialty.com", [MGMT]),
-      agent("BOSS@corespecialty.com", [MGMT, "other"]), // same person, different case
-      agent("agent@corespecialty.com", ["other"]), // not on the management team
-      agent("escape@corespecialty.com", [MGMT]), // a drain mailbox — mailing it would loop
-    ];
-    expect(seatAlertRecipients(agents, MGMT)).toEqual(["boss@corespecialty.com"]);
-  });
-
-  it("returns [] when nobody is on the team", () => {
-    expect(seatAlertRecipients([agent("a@x.com", ["other"])], MGMT)).toEqual([]);
-  });
-});
-
 describe("seatAlertSubject", () => {
   it("names the shortfall and the blocked-user count", () => {
     expect(seatAlertSubject({ message: "m", lackingSeats: 1 }, 1)).toBe(
@@ -174,16 +98,33 @@ describe("seatAlertSubject", () => {
   });
 });
 
-describe("sendSeatLimitAlert", () => {
+describe("seatAlertBody", () => {
+  it("names the blocked users, the shortfall, and the resolution", () => {
+    const body = seatAlertBody({
+      info: { message: "agents count (15) is greater than subscription allows (14)", lackingSeats: 1 },
+      blocked: [
+        { email: "jayvid.parra@corespecialty.com", name: "Jayvid Parra" },
+        { email: "nameless@corespecialty.com" },
+      ],
+    });
+    expect(body).toContain("Jayvid Parra <jayvid.parra@corespecialty.com>");
+    expect(body).toContain("- nameless@corespecialty.com");
+    expect(body).toContain("Additional licenses needed: 1");
+    expect(body).toContain("purchase additional agent licenses");
+  });
+});
+
+describe("sendSeatLimitAlert (through the real engine)", () => {
   const blocked = [{ email: "jayvid.parra@corespecialty.com", name: "Jayvid Parra" }];
   const info = { message: "agents count (15) is greater than subscription allows (14)", lackingSeats: 1 };
-  const agents = [agent("boss@corespecialty.com", [MGMT]), agent("vp@corespecialty.com", [MGMT])];
+  const agents: HelpdeskAgent[] = [
+    { ID: "a1", email: "boss@corespecialty.com", roles: ["normal"], teamIDs: [LICENSING_PROD] },
+  ];
 
   function opts(over: Record<string, unknown> = {}) {
     return {
       graph,
       agents,
-      managementTeamId: MGMT,
       blocked,
       info,
       environment: "Production",
@@ -194,74 +135,34 @@ describe("sendSeatLimitAlert", () => {
     };
   }
 
-  it("claims the day and mails every management-team member, from the Escape mailbox", async () => {
-    mock.onPut(CONTAINER).reply(201);
-    mock.onPut(/\/relay-state\/seat-alert/).reply(201);
+  it("routes to licensing under the stable seat-limit key, with the actionable content", async () => {
+    mock.onPut("/relay-state?restype=container").reply(201);
+    mock.onPut(/\/relay-state\/alert-/).reply(201);
 
     await expect(sendSeatLimitAlert(opts())).resolves.toBe("sent");
 
-    expect(sendMailViaGraph).toHaveBeenCalledTimes(2);
-    const calls = (sendMailViaGraph as jest.Mock).mock.calls.map(([a]) => a);
-    expect(calls.map((c) => c.to).sort()).toEqual(["boss@corespecialty.com", "vp@corespecialty.com"]);
-    expect(calls.every((c) => c.mailbox === SEAT_ALERT_FROM_MAILBOX)).toBe(true);
-    expect(SEAT_ALERT_FROM_MAILBOX).toBe("escape@corespecialty.com");
+    expect(sendMailViaGraph).toHaveBeenCalledTimes(1);
+    const [call] = (sendMailViaGraph as jest.Mock).mock.calls[0];
+    expect(call.to).toBe("boss@corespecialty.com");
+    expect(call.mailbox).toBe("escape@corespecialty.com");
+    expect(call.subject).toBe(
+      "Helpdesk agent licenses exhausted (1 more needed) — 1 user could not be added"
+    );
     // The body must name who was blocked and how many seats are short — that's the actionable part.
-    expect(calls[0].body).toContain("Jayvid Parra <jayvid.parra@corespecialty.com>");
-    expect(calls[0].body).toContain("Additional licenses needed: 1");
-    // Claimed under the ET day of the injected clock.
-    expect(mock.history.put.some((p) => p.url?.includes("seat-alert-production-2026-07-10"))).toBe(true);
+    expect(call.body).toContain("Jayvid Parra <jayvid.parra@corespecialty.com>");
+    expect(call.body).toContain("Additional licenses needed: 1");
+    expect(call.body).toContain("Environment: Production"); // the engine's footer
+    // Claimed under licensing/seat-limit for the ET day of the injected clock.
+    expect(
+      mock.history.put.some((p) => p.url?.includes("alert-production-licensing-seat-limit-2026-07-10"))
+    ).toBe(true);
   });
 
-  it("sends nothing on the second run of the same day (the blob claim is already held)", async () => {
-    mock.onPut(CONTAINER).reply(201);
-    mock.onPut(/\/relay-state\/seat-alert/).reply(409); // another invocation claimed it
-
-    await expect(sendSeatLimitAlert(opts())).resolves.toBe("throttled");
-    expect(sendMailViaGraph).not.toHaveBeenCalled();
-  });
-
-  it("sends nothing when the environment maps no management team (Development)", async () => {
-    await expect(sendSeatLimitAlert(opts({ managementTeamId: undefined }))).resolves.toBe(
+  it("sends nothing in Development — no licensing team is mapped there", async () => {
+    await expect(sendSeatLimitAlert(opts({ environment: "Development" }))).resolves.toBe(
       "not-configured"
     );
     expect(sendMailViaGraph).not.toHaveBeenCalled();
     expect(mock.history.put).toHaveLength(0); // never even touches storage
-  });
-
-  it("does not claim the day when the management team has no mailable agents", async () => {
-    const only = [agent("escape@corespecialty.com", [MGMT])]; // suppressed as a drain mailbox
-    await expect(sendSeatLimitAlert(opts({ agents: only }))).resolves.toBe("no-recipients");
-    expect(mock.history.put).toHaveLength(0);
-  });
-
-  it("still mails the rest of the team when one recipient's send fails", async () => {
-    mock.onPut(CONTAINER).reply(201);
-    mock.onPut(/\/relay-state\/seat-alert/).reply(201);
-    (sendMailViaGraph as jest.Mock)
-      .mockRejectedValueOnce(new Error("bad mailbox"))
-      .mockResolvedValueOnce(undefined);
-
-    await expect(sendSeatLimitAlert(opts())).resolves.toBe("sent");
-    expect(sendMailViaGraph).toHaveBeenCalledTimes(2);
-    expect(mock.history.delete).toHaveLength(0); // the day stays claimed — someone got it
-  });
-
-  it("releases the day's claim when EVERY send fails, so the next run retries", async () => {
-    mock.onPut(CONTAINER).reply(201);
-    mock.onPut(/\/relay-state\/seat-alert/).reply(201);
-    mock.onDelete(/\/relay-state\/seat-alert/).reply(202);
-    (sendMailViaGraph as jest.Mock).mockRejectedValue(new Error("graph down"));
-
-    await expect(sendSeatLimitAlert(opts())).resolves.toBe("no-recipients");
-    expect(mock.history.delete).toHaveLength(1);
-    expect(mock.history.delete[0].url).toContain("seat-alert-production-2026-07-10");
-  });
-
-  it("propagates a storage failure (fail-closed) rather than mailing unthrottled", async () => {
-    mock.onPut(CONTAINER).reply(201);
-    mock.onPut(/\/relay-state\/seat-alert/).reply(403);
-
-    await expect(sendSeatLimitAlert(opts())).rejects.toMatchObject({ response: { status: 403 } });
-    expect(sendMailViaGraph).not.toHaveBeenCalled();
   });
 });

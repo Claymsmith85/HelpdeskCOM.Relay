@@ -35,13 +35,10 @@ import {
 import { listGroupMemberUsers } from "./graph-directory";
 import { formatAxiosError } from "./logging";
 import { envPositiveNumber } from "./env";
-import { GroupRule, managementTeamForEnvironment, rulesForEnvironment } from "./team-mapping";
-import {
-  SeatAlertOutcome,
-  SeatLimitInfo,
-  seatLimitFromError,
-  sendSeatLimitAlert,
-} from "./seat-alert";
+import { GroupRule, rulesForEnvironment } from "./team-mapping";
+import { AlertOutcome } from "./alerts";
+import { SeatLimitInfo, seatLimitFromError, sendSeatLimitAlert } from "./seat-alert";
+import { SyncFailure, sendSyncFailureAlert } from "./sync-failure-alert";
 
 // #region Config
 
@@ -52,10 +49,7 @@ export type TeamSyncOptions = {
   dryRun: boolean;
   cleanupOrphans: boolean; // also reap PRE-EXISTING agents in no mapped group with zero teams
   protectedEmails: Set<string>; // emails (lowercased) never deleted — owner / break-glass admins
-  // Helpdesk team mailed when an invite is rejected for want of an agent license (seat-alert.ts).
-  // Undefined (e.g. Development) => the condition is logged but no mail is sent.
-  managementTeamId?: string;
-  // RELAY_ENVIRONMENT, carried through for the alert's daily-claim key and its body.
+  // RELAY_ENVIRONMENT, carried through for the alerts (routing row, daily-claim key, mail body).
   environment?: string;
 };
 
@@ -81,7 +75,6 @@ export function teamSyncOptionsFromEnv(): TeamSyncOptions {
     maxRemovals: envPositiveNumber(process.env.TEAM_SYNC_MAX_REMOVALS, 5, { integer: true }),
     defaultRole: (process.env.TEAM_SYNC_DEFAULT_ROLE ?? "normal").trim() || "normal",
     dryRun: (process.env.TEAM_SYNC_DRY_RUN ?? "").trim().toLowerCase() === "true",
-    managementTeamId: managementTeamForEnvironment(process.env.RELAY_ENVIRONMENT),
     environment: process.env.RELAY_ENVIRONMENT,
     // Default ON: decommission fully-orphaned agents (in no mapped group AND zero teams). Set
     // TEAM_SYNC_CLEANUP_ORPHANS=false to fall back to only deleting agents whose last mapped team
@@ -307,9 +300,11 @@ export type TeamSyncSummary = {
   existingAgents: number;
   // True when at least one invite was rejected because Helpdesk has no agent licenses left. This is
   // a *business* condition (buy seats), not a code fault — hence its own flag rather than just
-  // `failed > 0`. `seatAlert` records what the once-daily Management alert did about it.
+  // `failed > 0`. `seatAlert` records what the once-daily licensing alert did about it; `itAlert`
+  // records what the once-daily IT alert did about the run's OTHER (non-seat) failures.
   seatLimited: boolean;
-  seatAlert?: SeatAlertOutcome;
+  seatAlert?: AlertOutcome;
+  itAlert?: AlertOutcome;
 };
 
 /**
@@ -353,6 +348,9 @@ export async function runTeamSync(
   const desired: DesiredState = { agents: new Map(), suppressedTeams: new Set() };
   let groupReadFailures = 0;
   let groupsEmpty = 0; // reads that returned zero members (an empty group OR a silent bad read)
+  // Non-seat failures across the whole run (group reads + applies), digested into one once-daily
+  // IT alert at the end. Seat-limit rejections go to the licensing alert instead, not here.
+  const itFailures: SyncFailure[] = [];
 
   const upsert = (email: string, name: string): DesiredAgent => {
     let d = desired.agents.get(email);
@@ -388,6 +386,7 @@ export async function runTeamSync(
     } catch (e) {
       groupReadFailures++;
       if (rule.team) desired.suppressedTeams.add(rule.team);
+      itFailures.push({ op: "group-read", target: rule.group, error: e });
       log?.("Team sync: group read FAILED -> suppressing removals for team", {
         group: rule.group,
         team: rule.team,
@@ -490,12 +489,16 @@ export async function runTeamSync(
         teamIDs: inv.teamIDs,
         error: formatAxiosError(e),
       });
-      // "Out of agent licenses" is the one invite failure a human must act on. Collect it here and
-      // alert once, after every invite has been attempted, so one mail names all blocked users.
+      // Classify: "out of agent licenses" routes to the licensing alert (managers buy seats);
+      // every other rejection (422 schema drift, 5xx…) routes to the IT alert (devs fix code).
+      // Both are collected and alerted ONCE after every item has been attempted, so one mail
+      // digests the whole run.
       const seat = seatLimitFromError(e);
       if (seat) {
         seatLimit = seat;
         seatBlocked.push({ email: inv.email, name: inv.name });
+      } else {
+        itFailures.push({ op: "invite", target: inv.email, error: e });
       }
     }
   }
@@ -511,6 +514,7 @@ export async function runTeamSync(
       });
     } catch (e) {
       failed++;
+      itFailures.push({ op: "team-update", target: up.email, error: e });
       log?.("Team sync: team update FAILED", { email: up.email, error: formatAxiosError(e) });
     }
   }
@@ -525,19 +529,19 @@ export async function runTeamSync(
       });
     } catch (e) {
       failed++;
+      itFailures.push({ op: "delete", target: del.email, error: e });
       log?.("Team sync: delete FAILED", { email: del.email, error: formatAxiosError(e) });
     }
   }
 
-  // Best-effort by contract: the seat-limit alert must not change the sync's outcome. A failure to
-  // mail is logged and swallowed — the invite failures below still fail the run, as they should.
+  // Best-effort by contract: neither alert may change the sync's outcome. A failure to mail is
+  // logged and swallowed — the item failures below still fail the run, as they should.
   if (seatLimit) {
     summary.seatLimited = true;
     try {
       summary.seatAlert = await sendSeatLimitAlert({
         graph,
         agents,
-        managementTeamId: opts.managementTeamId,
         blocked: seatBlocked,
         info: seatLimit,
         environment: opts.environment,
@@ -545,6 +549,19 @@ export async function runTeamSync(
       });
     } catch (e) {
       log?.("Team sync: seat-limit alert FAILED", { error: formatAxiosError(e) });
+    }
+  }
+  if (itFailures.length > 0) {
+    try {
+      summary.itAlert = await sendSyncFailureAlert({
+        graph,
+        agents,
+        failures: itFailures,
+        environment: opts.environment,
+        log,
+      });
+    } catch (e) {
+      log?.("Team sync: sync-failure alert FAILED", { error: formatAxiosError(e) });
     }
   }
 

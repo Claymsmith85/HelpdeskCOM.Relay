@@ -39,17 +39,37 @@ export const RULES_BY_ENV: Record<string, GroupRule[]> = {
   ],
 };
 
-// The Helpdesk team whose members are emailed when an invite is rejected for want of an agent
-// license (see seat-alert.ts). Deliberately keyed off the same per-environment table above: the
-// recipients are the agents Helpdesk already has on this team, so the alert reaches the people who
-// can buy seats.
+// ---- Alert routing (see alerts.ts) ----
 //
-// `undefined` = no management team mapped for that environment => NO alert mail is sent there (the
-// seat-limit condition is still logged at ERROR). Development is intentionally undefined: it has no
-// Mgmt. Team rule, and Dev must never mail Production's managers.
-export const MANAGEMENT_TEAM_BY_ENV: Record<string, string | undefined> = {
-  Production: "4533d6c2-98fc-4563-855a-c5205f4c856d", // Mgmt. Team (see the Production rule above)
-  Development: undefined,
+// Every relay email alert has a CATEGORY, and each category routes to one Helpdesk team per
+// environment — the recipients are the agents Helpdesk already has on that team. Deliberately kept
+// in this file, next to the group rules: all the hardcoded per-environment team IDs live in one
+// PR-reviewed place.
+//
+//   - `licensing` — business conditions only a purchase fixes (e.g. out of agent seats). Goes to
+//     the people who hold the budget.
+//   - `it`        — operational faults in the relay's own machinery (API 4xx/5xx, group reads
+//     failing). Goes to the people who fix code and config.
+//
+// Adding a new category: extend AlertCategory, fill in a team per environment below (undefined =
+// that environment sends no mail for the category), and alerts.ts picks it up — its per-category
+// kill switch (`ALERT_<CATEGORY>_ENABLED`) works for the new name automatically.
+export type AlertCategory = "it" | "licensing";
+
+// `undefined` = no team mapped for that (environment, category) => NO alert mail is sent there
+// (the condition is still logged at ERROR). Licensing is Production-only: Dev shares the Helpdesk
+// account with Prod, so a Dev-mapped licensing team would mail Production's managers from the Dev
+// app. IT alerts are mapped in BOTH environments — a failing Dev sync is exactly what the
+// Development / IT Support team wants to hear about (the alert body names the environment).
+export const ALERT_TEAMS_BY_ENV: Record<string, Record<AlertCategory, string | undefined>> = {
+  Production: {
+    it: "61ed7601-b6e3-43c2-936a-7afe45e4e246", // Development / IT Support (see the rule above)
+    licensing: "4533d6c2-98fc-4563-855a-c5205f4c856d", // Mgmt. Team (see the rule above)
+  },
+  Development: {
+    it: "5a2356e8-8303-49eb-b8ac-838ab7287d8e", // Development / IT Support (Development table)
+    licensing: undefined,
+  },
 };
 
 // Default when RELAY_ENVIRONMENT is unset/unknown. MUST be the least-privileged table (never
@@ -66,13 +86,18 @@ export function rulesForEnvironment(envName: string | undefined): GroupRule[] {
 }
 
 /**
- * Resolve the Helpdesk team to notify about exhausted agent licenses. Mirrors
- * `rulesForEnvironment`'s fallback: an unset/unknown environment resolves to the Development table,
- * which has no management team — so an unconfigured deploy sends no alert mail rather than mailing
- * Production's managers.
+ * Resolve the Helpdesk team an alert category routes to. Mirrors `rulesForEnvironment`'s fallback:
+ * an unset/unknown environment resolves to the Development row — so a misconfigured deploy can
+ * never mail Production's managers (licensing is undefined there), while its IT alerts still reach
+ * the Development / IT Support team, who are exactly the people who should hear about a
+ * misconfigured deploy.
  */
-export function managementTeamForEnvironment(envName: string | undefined): string | undefined {
+export function alertTeamForEnvironment(
+  envName: string | undefined,
+  category: AlertCategory
+): string | undefined {
   const key = (envName ?? "").trim();
-  const known = Object.prototype.hasOwnProperty.call(MANAGEMENT_TEAM_BY_ENV, key);
-  return known ? MANAGEMENT_TEAM_BY_ENV[key] : MANAGEMENT_TEAM_BY_ENV[DEFAULT_ENVIRONMENT];
+  const known = Object.prototype.hasOwnProperty.call(ALERT_TEAMS_BY_ENV, key);
+  const row = known ? ALERT_TEAMS_BY_ENV[key] : ALERT_TEAMS_BY_ENV[DEFAULT_ENVIRONMENT];
+  return row?.[category];
 }

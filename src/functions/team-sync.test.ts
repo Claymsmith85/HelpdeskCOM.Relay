@@ -2,11 +2,16 @@
 // crux), and the runTeamSync orchestration (Graph + Helpdesk mocked with axios-mock-adapter on
 // injected clients). No @azure/functions side effects — the timer lives in sync-teams.ts.
 
-// The seat-limit alert has its own suite (seat-alert.test.ts); here we only assert runTeamSync
-// WIRES it up, so the send is stubbed while the real seatLimitFromError still classifies the error.
+// The alerts have their own suites (alerts/seat-alert/sync-failure-alert .test.ts); here we only
+// assert runTeamSync WIRES them up — which failures land in which alert — so the sends are stubbed
+// while the real seatLimitFromError still classifies each error.
 jest.mock("./seat-alert", () => ({
   ...jest.requireActual("./seat-alert"),
   sendSeatLimitAlert: jest.fn().mockResolvedValue("sent"),
+}));
+jest.mock("./sync-failure-alert", () => ({
+  ...jest.requireActual("./sync-failure-alert"),
+  sendSyncFailureAlert: jest.fn().mockResolvedValue("sent"),
 }));
 
 import axios from "axios";
@@ -21,6 +26,7 @@ import {
 } from "./team-sync";
 import { HelpdeskAgent } from "./helpdesk-client";
 import { sendSeatLimitAlert } from "./seat-alert";
+import { sendSyncFailureAlert } from "./sync-failure-alert";
 
 // ---- helpers ----
 
@@ -307,6 +313,7 @@ describe("runTeamSync (orchestration)", () => {
     gmock = new MockAdapter(graph);
     hmock = new MockAdapter(helpdesk);
     (sendSeatLimitAlert as jest.Mock).mockClear().mockResolvedValue("sent");
+    (sendSyncFailureAlert as jest.Mock).mockClear().mockResolvedValue("sent");
   });
   afterEach(() => {
     gmock.restore();
@@ -368,7 +375,7 @@ describe("runTeamSync (orchestration)", () => {
     },
   };
 
-  it("alerts management once when invites are rejected for want of agent licenses", async () => {
+  it("routes seat-limit rejections to the LICENSING alert, once, naming every blocked user", async () => {
     mockGroups({
       G1: [
         { id: "1", displayName: "Jayvid Parra", mail: "jayvid.parra@x.com", accountEnabled: true },
@@ -381,14 +388,13 @@ describe("runTeamSync (orchestration)", () => {
     ]);
     hmock.onPost("/agents").reply(409, SEAT_409);
 
-    const withMgmt = { ...opts, managementTeamId: "MGMT", environment: "Production" };
+    const prod = { ...opts, environment: "Production" };
     // Invite failures still fail the run — the alert informs, it does not absolve.
-    await expect(runTeamSync(graph, helpdesk, withMgmt)).rejects.toThrow(/2 change\(s\)/);
+    await expect(runTeamSync(graph, helpdesk, prod)).rejects.toThrow(/2 change\(s\)/);
 
     // ONE alert naming BOTH blocked users, not one per failed invite.
     expect(sendSeatLimitAlert).toHaveBeenCalledTimes(1);
     const arg = (sendSeatLimitAlert as jest.Mock).mock.calls[0][0];
-    expect(arg.managementTeamId).toBe("MGMT");
     expect(arg.environment).toBe("Production");
     expect(arg.info).toEqual({
       message: "agents count (15) is greater than subscription allows (14)",
@@ -398,34 +404,99 @@ describe("runTeamSync (orchestration)", () => {
       "jayvid.parra@x.com",
       "second@x.com",
     ]);
-    // The agent list is passed through so the alert can resolve the management team's members.
+    // The agent list is passed through so the alert can resolve the routed team's members.
     expect(arg.agents).toHaveLength(1);
+    // A seat limit is a licensing problem, not an IT one — devs can't fix a full subscription.
+    expect(sendSyncFailureAlert).not.toHaveBeenCalled();
   });
 
-  it("does not alert when an invite fails for a NON-seat reason (e.g. duplicate email)", async () => {
+  it("routes a NON-seat invite failure (e.g. duplicate email) to the IT alert, not licensing", async () => {
     mockGroups({ G1: [{ id: "1", displayName: "New", mail: "new@x.com", accountEnabled: true }], GV: [] });
     hmock.onGet("/agents").reply(200, []);
     hmock
       .onPost("/agents")
       .reply(409, { error: { type: "conflict", message: "agent with this email already exists" } });
 
-    await expect(
-      runTeamSync(graph, helpdesk, { ...opts, managementTeamId: "MGMT" })
-    ).rejects.toThrow(/1 change\(s\)/);
+    await expect(runTeamSync(graph, helpdesk, opts)).rejects.toThrow(/1 change\(s\)/);
     expect(sendSeatLimitAlert).not.toHaveBeenCalled();
+    expect(sendSyncFailureAlert).toHaveBeenCalledTimes(1);
+    const arg = (sendSyncFailureAlert as jest.Mock).mock.calls[0][0];
+    expect(arg.failures).toHaveLength(1);
+    expect(arg.failures[0]).toMatchObject({ op: "invite", target: "new@x.com" });
+  });
+
+  it("splits a mixed run: seat rejections to licensing, everything else to IT — one mail each", async () => {
+    mockGroups({
+      G1: [
+        { id: "1", displayName: "Seatless", mail: "seatless@x.com", accountEnabled: true },
+        { id: "2", displayName: "Broken", mail: "broken@x.com", accountEnabled: true },
+      ],
+      GV: [],
+    });
+    hmock.onGet("/agents").reply(200, []);
+    // Invites run in desired-state (group-member) order: seatless first, broken second.
+    hmock
+      .onPost("/agents")
+      .replyOnce(409, SEAT_409)
+      .onPost("/agents")
+      .replyOnce(422, { error: { type: "validation", message: "Validation error" } });
+
+    await expect(runTeamSync(graph, helpdesk, opts)).rejects.toThrow(/2 change\(s\)/);
+
+    expect(sendSeatLimitAlert).toHaveBeenCalledTimes(1);
+    const seatArg = (sendSeatLimitAlert as jest.Mock).mock.calls[0][0];
+    expect(seatArg.blocked.map((b: any) => b.email)).toEqual(["seatless@x.com"]);
+
+    expect(sendSyncFailureAlert).toHaveBeenCalledTimes(1);
+    const itArg = (sendSyncFailureAlert as jest.Mock).mock.calls[0][0];
+    expect(itArg.failures.map((f: any) => [f.op, f.target])).toEqual([["invite", "broken@x.com"]]);
+  });
+
+  it("routes team-update and delete failures to the IT alert with their op and target", async () => {
+    mockGroups({
+      G1: [{ id: "1", displayName: "Keep", mail: "keep@x.com", accountEnabled: true }],
+      GV: [],
+    });
+    hmock.onGet("/agents").reply(200, [
+      // keep@x.com needs T1 added -> update; gone@x.com is undesired with only T1 -> delete.
+      { ID: "a-keep", email: "keep@x.com", roles: ["normal"], teamIDs: [], status: "active" },
+      { ID: "a-gone", email: "gone@x.com", roles: ["normal"], teamIDs: ["T1"], status: "active" },
+    ]);
+    hmock.onPatch(/\/agents\/.+/).reply(500, { error: { type: "server", message: "boom" } });
+    hmock.onDelete(/\/agents\/.+/).reply(503);
+
+    await expect(runTeamSync(graph, helpdesk, opts)).rejects.toThrow(/2 change\(s\)/);
+
+    expect(sendSeatLimitAlert).not.toHaveBeenCalled();
+    expect(sendSyncFailureAlert).toHaveBeenCalledTimes(1);
+    const arg = (sendSyncFailureAlert as jest.Mock).mock.calls[0][0];
+    expect(arg.failures.map((f: any) => [f.op, f.target]).sort()).toEqual([
+      ["delete", "gone@x.com"],
+      ["team-update", "keep@x.com"],
+    ]);
   });
 
   it("a failing alert never changes the sync's own outcome", async () => {
     (sendSeatLimitAlert as jest.Mock).mockRejectedValueOnce(new Error("storage down"));
-    mockGroups({ G1: [{ id: "1", displayName: "New", mail: "new@x.com", accountEnabled: true }], GV: [] });
+    (sendSyncFailureAlert as jest.Mock).mockRejectedValueOnce(new Error("storage down"));
+    mockGroups({
+      G1: [
+        { id: "1", displayName: "New", mail: "new@x.com", accountEnabled: true },
+        { id: "2", displayName: "Broken", mail: "broken@x.com", accountEnabled: true },
+      ],
+      GV: [],
+    });
     hmock.onGet("/agents").reply(200, []);
-    hmock.onPost("/agents").reply(409, SEAT_409);
+    hmock
+      .onPost("/agents")
+      .replyOnce(409, SEAT_409)
+      .onPost("/agents")
+      .replyOnce(422, { error: { type: "validation", message: "Validation error" } });
 
-    // Still the invite-failure error, not the alert's — and `seatLimited` is not lost.
-    await expect(
-      runTeamSync(graph, helpdesk, { ...opts, managementTeamId: "MGMT" })
-    ).rejects.toThrow(/1 change\(s\)/);
+    // Still the invite-failure error, not either alert's.
+    await expect(runTeamSync(graph, helpdesk, opts)).rejects.toThrow(/2 change\(s\)/);
     expect(sendSeatLimitAlert).toHaveBeenCalledTimes(1);
+    expect(sendSyncFailureAlert).toHaveBeenCalledTimes(1);
   });
 
   it("suppresses removals when a team group reads empty (no delete despite a stale agent)", async () => {
@@ -457,6 +528,10 @@ describe("runTeamSync (orchestration)", () => {
 
     await expect(runTeamSync(graph, helpdesk, opts)).rejects.toThrow(/group read/i);
     expect(hmock.history.delete).toHaveLength(0); // removal suppressed by the failure
+    // A failed group read is an IT problem (Graph permissions, deleted group…) — it alerts too.
+    expect(sendSyncFailureAlert).toHaveBeenCalledTimes(1);
+    const arg = (sendSyncFailureAlert as jest.Mock).mock.calls[0][0];
+    expect(arg.failures[0]).toMatchObject({ op: "group-read", target: "G1" });
   });
 
   it("reaps a pre-existing orphan (no group, zero teams) when all group reads succeed", async () => {
