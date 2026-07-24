@@ -306,6 +306,43 @@ App-setting values (non-secret) are supplied at deploy time from `Deploy.yml` (`
 
 ---
 
+# LiveChat Transcript Backlog Export
+
+[`scripts/Export-LiveChatTranscripts.ps1`](scripts/Export-LiveChatTranscripts.ps1)
+downloads archived LiveChat threads through the Text Agent Chat API v3.6
+[`list_archives`](https://platform.text.com/docs/messaging/agent-chat-api/#list-archives)
+action. It writes complete JSON records, readable text transcripts, and a CSV
+manifest under `<output>/<year>/<month>/`. Existing transcripts are skipped, so
+an interrupted backlog export can be resumed by running the same command again.
+
+Create a Text Personal Access Token with `chats--all:ro` (all groups) or
+`chats--access:ro` (the token owner's groups), then use either the Base64
+credential shown by the Developer Console:
+
+```powershell
+$env:LIVECHAT_BASIC_TOKEN = '<base64 credential>'
+.\scripts\Export-LiveChatTranscripts.ps1 -FromMonth 2024-01
+```
+
+or the raw account ID and token:
+
+```powershell
+$env:LIVECHAT_ACCOUNT_ID = '<account id>'
+$env:LIVECHAT_PAT = '<personal access token>'
+.\scripts\Export-LiveChatTranscripts.ps1 `
+    -FromMonth 2024-01 `
+    -ToMonth 2025-12 `
+    -OutputPath D:\Exports\LiveChat
+```
+
+The default output folder, `livechat-transcripts/`, is gitignored because the
+exports contain customer data. Use `Get-Help` on the script for group filters,
+JSON-only output, overwrite behavior, and all other options. File events and
+their URLs are preserved in the transcript; attached file contents are not
+downloaded.
+
+---
+
 # Local Development
 
 Prerequisites: Node 24.x, Azure Functions Core Tools v4.
