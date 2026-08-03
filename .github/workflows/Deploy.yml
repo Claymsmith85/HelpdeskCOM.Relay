@@ -205,11 +205,6 @@ jobs:
                 "value": "${{ vars.SPO_SITE_URL }}"
               },
               {
-                "name": "RELAY_HASH_DOMAIN",
-                "slotSetting": false,
-                "value": "${{ vars.RELAY_HASH_DOMAIN }}"
-              },
-              {
                 "name": "MAILBOX_ADDRESSES",
                 "slotSetting": false,
                 "value": "${{ vars.MAILBOX_ADDRESSES }}"

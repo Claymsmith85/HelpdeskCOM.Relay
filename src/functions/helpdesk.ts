@@ -1,6 +1,6 @@
 // src/functions/helpdesk.ts
-// Helpdesk webhook handler. On a UI-authored tickets.create it patches the decoded requester
-// email and (only for agent replies) emails the requester; on tickets.update it emails the
+// Helpdesk webhook handler. On a UI-authored tickets.create it patches the requester email into
+// customFields and (only for agent replies) emails the requester; on tickets.update it emails the
 // requester for agent-authored, non-email, non-private, non-system-note events. Outbound mail
 // goes through Graph sendMail from the shared mailbox. See README "Helpdesk Webhook Flow".
 import {
@@ -16,7 +16,6 @@ import { createGraphClientFromEnv } from "./graph-client";
 import { sendMailViaGraph } from "./graph-mail";
 import { agentReplyEmail } from "./templates";
 import { createHelpdeskClient, patchCustomFields } from "./helpdesk-client";
-import { decodeRequesterEmail, hashDomain } from "./requester-hash";
 import { shouldSuppressRecipient } from "./routing";
 import { createStepLogger, type StepFn } from "./logging";
 import { ticketingEnabled } from "./env";
@@ -57,8 +56,8 @@ export async function helpdesk(
   const graph = await createGraphClientFromEnv();
 
   /**
-   * tickets.create (from the Helpdesk UI): patch the decoded requester email, and email the
-   * requester only when the create's last event is an agent reply. Customer-emails-in are
+   * tickets.create (from the Helpdesk UI): patch the requester email into customFields, and email
+   * the requester only when the create's last event is an agent reply. Customer-emails-in are
    * client-authored and already handled by the inbound worker, so they are not echoed back.
    */
   if (
@@ -69,7 +68,7 @@ export async function helpdesk(
     // Helpdesk retries the webhook, and sendAgentReply runs again — a DUPLICATE email to the
     // requester (the send is not idempotent). Log and move on instead.
     try {
-      const email = decodeRequesterEmail(payload.payload.requester.email, hashDomain());
+      const email = (payload.payload.requester.email ?? "").trim();
       await patchCustomFields(createHelpdeskClient(), payload.payload.ID, { email });
 
       const text = selectEmailableAgentMessage(events);

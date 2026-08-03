@@ -7,7 +7,7 @@
 //   - tickets.update emails only on agent-authored, non-email, non-system, non-private.
 //
 // @azure/functions, ./graph-client, ./graph-mail and ./helpdesk-client are mocked so we can
-// assert the customFields patch + the Graph sendMail without real HTTP. requester-hash is real.
+// assert the customFields patch + the Graph sendMail without real HTTP.
 
 jest.mock("@azure/functions", () => ({
   app: { http: jest.fn(), setup: jest.fn() },
@@ -27,7 +27,6 @@ import { helpdesk } from "./helpdesk";
 import { sendMailViaGraph } from "./graph-mail";
 import { patchCustomFields } from "./helpdesk-client";
 
-const INBOUND = "core-parser-01.corespecialty.com";
 const sendMock = sendMailViaGraph as jest.Mock;
 const patchMock = patchCustomFields as jest.Mock;
 
@@ -40,13 +39,11 @@ function fakeRequest(payload: any) {
 }
 
 beforeEach(() => {
-  process.env.RELAY_HASH_DOMAIN = INBOUND;
   // Ticketing is OFF by default; these tests exercise enabled behavior. Disabled path has its own test.
   process.env.TICKETING_TOGGLE = "true";
 });
 
 afterEach(() => {
-  delete process.env.RELAY_HASH_DOMAIN;
   delete process.env.MAILBOX_ADDRESSES;
   delete process.env.TICKETING_TOGGLE;
 });
@@ -59,7 +56,7 @@ describe("TICKETING_TOGGLE (master mail-flow switch)", () => {
       shortID: "ABC",
       subject: "Customer question",
       source: { type: "email", detailedSource: "helpdesk" },
-      requester: { email: `john=example.com@${INBOUND}`, name: "John" },
+      requester: { email: "john@example.com", name: "John" },
       customFields: { email: "", inbox: "escape@corespecialty.com" },
       events: [
         { author: { type: "agent" }, source: { type: "api" }, message: { text: "Agent reply", isPrivate: false } },
@@ -98,7 +95,7 @@ describe("tickets.create from Helpdesk", () => {
         shortID: "ABC",
         subject: "Customer question",
         source: { type: "email", detailedSource: "helpdesk" },
-        requester: { email: `john=example.com@${INBOUND}`, name: "John" },
+        requester: { email: "john@example.com", name: "John" },
         customFields: { email: "", inbox: "escape@corespecialty.com" },
         events: [
           { author: { type: lastAuthorType }, source: { type: "api" }, message: { text, isPrivate: false } },
@@ -107,7 +104,7 @@ describe("tickets.create from Helpdesk", () => {
     };
   }
 
-  it("patches customFields.email (decoded) but does NOT email when client-authored", async () => {
+  it("patches customFields.email from the requester but does NOT email when client-authored", async () => {
     await helpdesk(fakeRequest(createPayload("client")), fakeContext());
 
     expect(patchMock).toHaveBeenCalledTimes(1);
@@ -147,10 +144,10 @@ describe("tickets.create from Helpdesk", () => {
     expect(sendMock).not.toHaveBeenCalled();
   });
 
-  it("patches but suppresses the reply when the decoded requester is a monitored mailbox (loop guard)", async () => {
+  it("patches but suppresses the reply when the requester is a monitored mailbox (loop guard)", async () => {
     process.env.MAILBOX_ADDRESSES = "escape@corespecialty.com";
     const payload = createPayload("agent", "Agent reply here");
-    payload.payload.requester.email = `escape=corespecialty.com@${INBOUND}`; // decodes to escape@corespecialty.com
+    payload.payload.requester.email = "escape@corespecialty.com";
     await helpdesk(fakeRequest(payload), fakeContext());
 
     expect(patchMock).toHaveBeenCalledTimes(1); // customFields still patched

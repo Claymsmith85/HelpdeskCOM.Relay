@@ -1,6 +1,5 @@
 // src/functions/routing.ts
 // Inbox → team routing and the inbound loop guard. Pure helpers, no I/O.
-import { hashDomain } from "./requester-hash";
 
 // Map normalized inbox -> Helpdesk team ID.
 const TEAM_BY_INBOX: Record<string, string> = {
@@ -15,11 +14,12 @@ const TEAM_BY_INBOX: Record<string, string> = {
 const DEFAULT_TEAM_ID = TEAM_BY_INBOX["escape@corespecialty.com"];
 
 // Senders that should never generate tickets (loops / system senders).
-const IGNORED_SENDER_PATTERNS = [
-  () => hashDomain(),
-  () => "helpdesk.com",
-  () => "corespecialty.onmicrosoft.com",
-];
+const IGNORED_SENDER_PATTERNS = ["helpdesk.com", "corespecialty.onmicrosoft.com"];
+
+// Bounce/NDR senders (matched on the exact local part): a bounce landing in a drained inbox must
+// never open a ticket — a second bounce could subject-match the first ticket and trigger an ack,
+// and an ack that itself bounces would ping-pong with the remote MTA indefinitely.
+const BOUNCE_SENDER_LOCAL_PARTS = ["postmaster", "mailer-daemon"];
 
 // Our mailboxes all live under one UPN domain. The same mailbox is frequently *addressed* on an
 // alias domain (e.g. ureferrals@corespecialtyins.com is really ureferrals@corespecialty.com), and
@@ -60,19 +60,25 @@ export function routeTeam(normalizedInbox: string): string {
 }
 
 /**
- * Suppress processing for senders that should never generate tickets (loops / system senders).
- * Matches on the address's DOMAIN (the part after the last "@"), exact or as a dot-suffix for
- * subdomains — NOT a loose substring — so a lookalike like `x@foohelpdesk.com`,
- * `x@helpdesk.com.evil.test`, or a pattern sitting in the local part (`helpdesk.com@gmail.com`) is
- * not treated as an ignored sender.
+ * Suppress processing for senders that should never generate tickets (loops / system senders /
+ * bounces). Two checks:
+ *   1. Domain patterns — matched on the part after the last "@", exact or as a dot-suffix for
+ *      subdomains — NOT a loose substring — so a lookalike like `x@foohelpdesk.com`,
+ *      `x@helpdesk.com.evil.test`, or a pattern sitting in the local part (`helpdesk.com@gmail.com`)
+ *      is not treated as an ignored sender.
+ *   2. Bounce senders — the exact local part is `postmaster`/`mailer-daemon` (any domain). Exact
+ *      match only, so a person like `postmaster.smith@example.com` still gets a ticket.
  */
 export function shouldIgnoreSender(address: string): boolean {
-  const domain = (address.split("@").pop() ?? "").trim().toLowerCase();
+  const at = address.lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = address.slice(at + 1).trim().toLowerCase();
   if (!domain) return false;
-  return IGNORED_SENDER_PATTERNS.some((f) => {
-    const pattern = f().toLowerCase();
-    return domain === pattern || domain.endsWith(`.${pattern}`);
-  });
+  const local = address.slice(0, at).trim().toLowerCase();
+  if (BOUNCE_SENDER_LOCAL_PARTS.includes(local)) return true;
+  return IGNORED_SENDER_PATTERNS.some(
+    (pattern) => domain === pattern || domain.endsWith(`.${pattern}`)
+  );
 }
 
 // Company domains the relay's drain mailboxes live on. Used ONLY to recognize an alias-domain
@@ -107,8 +113,8 @@ function monitoredMailboxAddresses(): string[] {
  * Whether the relay must NOT send to `address` — sending would loop mail back into a drained inbox
  * (re-ingested as a new inbound → ticket → ack → …). The outbound counterpart to
  * `shouldIgnoreSender`. Suppresses, in order:
- *   1. system/loop addresses we'd never reply to anyway (hash sink, `helpdesk.com`, the
- *      `onmicrosoft.com` tenant) — reuses `shouldIgnoreSender`;
+ *   1. system/loop addresses we'd never reply to anyway (`helpdesk.com`, the `onmicrosoft.com`
+ *      tenant, `postmaster`/`mailer-daemon` bounce senders) — reuses `shouldIgnoreSender`;
  *   2. one of OUR drain mailboxes (`MAILBOX_ADDRESSES`) — by exact match (any domain), OR by
  *      canonical mailbox key so the SAME mailbox addressed under an alias company domain is also
  *      caught (e.g. `MAILBOX_ADDRESSES` lists `escape@corespecialtyins.com` but the mailbox is also

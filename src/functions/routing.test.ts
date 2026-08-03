@@ -1,5 +1,5 @@
-// Tests for inbox->team routing and the inbound loop guard (routing.ts). Pure helpers; the
-// loop guard reads the hash domain via requester-hash, so no @azure/functions mock is needed.
+// Tests for inbox->team routing and the inbound loop guard (routing.ts). Pure helpers with no
+// registration side effects, so no @azure/functions mock is needed.
 
 import {
   normalizeInbox,
@@ -11,12 +11,6 @@ import {
 const TEAM_ESCAPE = "3db812da-2055-436f-9889-7073b5e976f4";
 const TEAM_UREFERRALS = "61ed7601-b6e3-43c2-936a-7afe45e4e246";
 const TEAM_ESCAPE_REFERRALS = "3a5e9d73-e5a0-442e-888b-6573672c9d05";
-
-// hashDomain() now REQUIRES RELAY_HASH_DOMAIN (no hardcoded default), and the loop guard reads it,
-// so give every test a value; specific tests below override or delete it to exercise edge behavior.
-beforeEach(() => {
-  process.env.RELAY_HASH_DOMAIN = "core-parser-01.corespecialty.com";
-});
 
 describe("normalizeInbox", () => {
   it("rewrites the domain to corespecialty.com, keeping the local part", () => {
@@ -43,23 +37,18 @@ describe("routeTeam", () => {
 });
 
 describe("shouldIgnoreSender", () => {
-  const ORIGINAL = process.env.RELAY_HASH_DOMAIN;
-  afterEach(() => {
-    if (ORIGINAL === undefined) delete process.env.RELAY_HASH_DOMAIN;
-    else process.env.RELAY_HASH_DOMAIN = ORIGINAL;
-  });
-
   it("ignores helpdesk.com and the onmicrosoft tenant senders", () => {
     expect(shouldIgnoreSender("noreply@helpdesk.com")).toBe(true);
     expect(shouldIgnoreSender("svc@corespecialty.onmicrosoft.com")).toBe(true);
   });
-  it("ignores the configured hash domain (loop guard)", () => {
-    process.env.RELAY_HASH_DOMAIN = "core-parser-01.corespecialty.com";
-    expect(shouldIgnoreSender("bounce@core-parser-01.corespecialty.com")).toBe(true);
+  it("ignores bounce senders (postmaster/mailer-daemon local part, any domain)", () => {
+    expect(shouldIgnoreSender("postmaster@example.com")).toBe(true);
+    expect(shouldIgnoreSender("mailer-daemon@googlemail.com")).toBe(true);
+    expect(shouldIgnoreSender("Postmaster@CoreSpecialty.com")).toBe(true); // case-insensitive
   });
-  it("throws when no hash domain is configured (required env, no hardcoded default)", () => {
-    delete process.env.RELAY_HASH_DOMAIN;
-    expect(() => shouldIgnoreSender("x@core-parser-01.corespecialty.com")).toThrow(/RELAY_HASH_DOMAIN/);
+  it("does NOT ignore an address that merely contains a bounce local part (exact match only)", () => {
+    expect(shouldIgnoreSender("postmaster.smith@example.com")).toBe(false);
+    expect(shouldIgnoreSender("not-mailer-daemon@example.com")).toBe(false);
   });
   it("does not ignore a normal external sender", () => {
     expect(shouldIgnoreSender("customer@gmail.com")).toBe(false);
@@ -80,7 +69,6 @@ describe("shouldIgnoreSender", () => {
 describe("shouldSuppressRecipient (outbound loop guard)", () => {
   const ORIG_MB = process.env.MAILBOX_ADDRESSES;
   const ORIG_DOMAINS = process.env.RELAY_IN_SCOPE_DOMAINS;
-  const ORIG_HASH = process.env.RELAY_HASH_DOMAIN;
   beforeEach(() => {
     // The drain mailboxes as actually configured — enumerated on the alias domain only.
     process.env.MAILBOX_ADDRESSES =
@@ -91,7 +79,6 @@ describe("shouldSuppressRecipient (outbound loop guard)", () => {
       v === undefined ? delete process.env[k] : (process.env[k] = v);
     restore("MAILBOX_ADDRESSES", ORIG_MB);
     restore("RELAY_IN_SCOPE_DOMAINS", ORIG_DOMAINS);
-    restore("RELAY_HASH_DOMAIN", ORIG_HASH);
   });
 
   it("suppresses a drain mailbox by exact MAILBOX_ADDRESSES match", () => {

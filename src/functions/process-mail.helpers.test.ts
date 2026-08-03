@@ -1,6 +1,6 @@
 // Unit tests for the pure helpers that remain in process-mail.ts (attachment policy, queue-item
-// parsing). Routing, requester-hash, and the Helpdesk client moved to their own modules (see
-// routing.test / requester-hash.roundtrip / helpdesk-client.test); the email/ticket copy moved to
+// parsing). Routing and the Helpdesk client moved to their own modules (see
+// routing.test / helpdesk-client.test); the email/ticket copy moved to
 // templates.ts (see templates.test). The inbound body now reaches the ticket UNMODIFIED — the full
 // email thread is preserved, so there is no body-trimming/cleaning step to test. Importing
 // process-mail registers a queue trigger at module load, so @azure/functions is mocked to a no-op

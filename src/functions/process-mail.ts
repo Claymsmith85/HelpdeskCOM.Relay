@@ -6,7 +6,7 @@
 // message to a processed folder so duplicate notifications are no-ops.
 //
 // API/identity/routing/logging concerns live in their own modules (helpdesk-client,
-// requester-hash, routing, logging); this file is the workflow + the attachment policy.
+// routing, logging); this file is the workflow + the attachment policy.
 import { app, InvocationContext } from "@azure/functions";
 import { AxiosError, AxiosInstance } from "axios";
 
@@ -50,7 +50,6 @@ import {
   findExistingTicket,
   type TicketSummary,
 } from "./helpdesk-client";
-import { hashDomain, toInboundHashedEmail } from "./requester-hash";
 import { normalizeInbox, normalizeMailboxKey, routeTeam, shouldIgnoreSender, shouldSuppressRecipient } from "./routing";
 import {
   createBufferedLogger,
@@ -374,7 +373,7 @@ async function processSingleMessage(
     return;
   }
 
-  // Only the sender is truly required: without it there is no requester to hash and nobody to
+  // Only the sender is truly required: without it there is no requester and nobody to
   // reply to. A blank subject or empty body is recoverable — substitute a placeholder so an
   // attachment-only or subject-less email still creates a ticket and gets an ack, instead of
   // being silently filed away unanswered (quiet data loss).
@@ -393,8 +392,6 @@ async function processSingleMessage(
   }
 
   const helpdesk = createHelpdeskClient();
-  const requesterHashed = toInboundHashedEmail(parsed.fromAddress, hashDomain());
-  step("Compute: requesterHashed", { requesterHashed });
 
   step("Graph: listMessageAttachments begin");
   const attachmentInfos = await listMessageAttachments(
@@ -416,9 +413,10 @@ async function processSingleMessage(
   });
 
   step("Helpdesk: listTicketsByRequester begin");
-  const tickets = await listTicketsByRequester(helpdesk, requesterHashed);
+  const tickets = await listTicketsByRequester(helpdesk, parsed.fromAddress);
   const existingTicket = findExistingTicket(parsed.subject, tickets);
   step("Helpdesk: ticket lookup", {
+    requester: parsed.fromAddress,
     count: tickets.length,
     found: !!existingTicket,
     ticketId: existingTicket?.ID ?? null,
@@ -436,7 +434,7 @@ async function processSingleMessage(
     });
   } else {
     await handleNewTicket({
-      helpdesk, parsed, requesterHashed, teamId, normalizedInbox,
+      helpdesk, parsed, teamId, normalizedInbox,
       uploadItems, blocked: plan.blocked, step, stepError,
     });
   }
@@ -522,7 +520,6 @@ async function handleExistingTicket(opts: {
 async function handleNewTicket(opts: {
   helpdesk: AxiosInstance;
   parsed: InboundMessage;
-  requesterHashed: string;
   teamId: string;
   normalizedInbox: string;
   uploadItems: SharePointUploadItem[];
@@ -531,14 +528,14 @@ async function handleNewTicket(opts: {
   stepError: StepErrorFn;
 }): Promise<void> {
   const {
-    helpdesk, parsed, requesterHashed, teamId, normalizedInbox,
+    helpdesk, parsed, teamId, normalizedInbox,
     uploadItems, blocked, step, stepError,
   } = opts;
 
   const createdTicketId = await createTicket({
     helpdesk,
     subject: parsed.subject,
-    requesterEmail: requesterHashed,
+    requesterEmail: parsed.fromAddress,
     requesterName: parsed.fromName ?? parsed.fromAddress,
     teamId,
     messageText: parsed.text, // full email body, entire thread included (no quote/signature stripping)
@@ -547,9 +544,9 @@ async function handleNewTicket(opts: {
   step("Helpdesk: createTicket complete", { createdTicketId });
 
   // No "ticket has been created" notice is sent to the requester — neither from the relay nor from
-  // Helpdesk (the hashed requester sink keeps Helpdesk's own notification from reaching them). A new
-  // ticket is opened silently. Replies to an EXISTING ticket are still acked (handleExistingTicket),
-  // and agent replies still go out via the helpdesk webhook.
+  // Helpdesk (Helpdesk's own requester notifications are disabled in its admin settings — see
+  // CLAUDE.md invariant #2). A new ticket is opened silently. Replies to an EXISTING ticket are
+  // still acked (handleExistingTicket), and agent replies still go out via the helpdesk webhook.
 
   const { folderWebUrl, uploadedLinks } = await uploadToTicket({
     helpdesk, ticketId: createdTicketId, fromAddress: parsed.fromAddress, uploadItems, step, stepError,

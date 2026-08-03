@@ -2,7 +2,7 @@
 //
 // What these lock in:
 //   - ignored senders are skipped (no ticket) but still moved to the processed folder
-//   - the new-ticket happy path: create ticket (hashed requester + routed team) SILENTLY — no
+//   - the new-ticket happy path: create ticket (real requester + routed team) SILENTLY — no
 //     "ticket created" notice is sent to the requester — then move to processed
 //   - the existing-ticket path uploads attachments and appends folder + filenames
 //   - oversize attachments: no upload, agent System note, reply ack still sent
@@ -74,7 +74,6 @@ import {
 import { uploadAttachmentsToSharePoint } from "./sharepoint";
 import { acquireDrainLock } from "./drain-lock";
 
-const INBOUND = "core-parser-01.corespecialty.com";
 const TEAM_ESCAPE = "3db812da-2055-436f-9889-7073b5e976f4";
 const MAILBOX = "MB-GUID";
 
@@ -110,7 +109,6 @@ function fakeContext() {
 }
 
 beforeEach(() => {
-  process.env.RELAY_HASH_DOMAIN = INBOUND;
   process.env.HELPDESK_PAT = "pat-token";
   // Ticketing is OFF by default (default-OFF master switch); these workflow tests exercise the
   // enabled behavior, so turn it on. The disabled path is covered in its own describe below.
@@ -136,7 +134,6 @@ beforeEach(() => {
 afterEach(() => {
   hdMock.restore();
   createSpy.mockRestore();
-  delete process.env.RELAY_HASH_DOMAIN;
   delete process.env.HELPDESK_PAT;
   delete process.env.TICKETING_TOGGLE;
 });
@@ -304,13 +301,13 @@ describe("new ticket happy path", () => {
     hdMock.onPatch(/\/tickets\/NEW1/).reply(200, {});
   });
 
-  it("creates a routed ticket with the hashed requester and sends NO customer notice", async () => {
+  it("creates a routed ticket with the real requester and sends NO customer notice", async () => {
     await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
 
     expect(hdMock.history.post).toHaveLength(1);
     const created = JSON.parse(hdMock.history.post[0].data);
     expect(created.subject).toBe("Need help");
-    expect(created.requester.email).toBe(`john=example.com@${INBOUND}`);
+    expect(created.requester.email).toBe("john@example.com");
     expect(created.requester.name).toBe("John Doe");
     expect(created.assignment.team.ID).toBe(TEAM_ESCAPE);
     expect(created.customFields.email).toBe("john@example.com");

@@ -36,7 +36,6 @@ src/
     graph-mail.ts          # Graph mail I/O (read message/attachments, sendMail, move, builders)
     sharepoint.ts          # Graph upload helpers (site/drive/folder; content PUT or chunked session)
     helpdesk-client.ts     # Helpdesk REST client + ticket operations
-    requester-hash.ts      # Requester hash encode/decode round-trip
     routing.ts             # Inbox -> team routing + inbound loop guard
     logging.ts             # Shared step / buffered loggers
     subscriptions.ts       # Graph subscription create/renew
@@ -79,16 +78,16 @@ Sender → native shared mailbox (Inbox)
    - **Ignores mail received before `MAIL_IGNORE_BEFORE`** (default the go-live boundary): the listing is filtered server-side (`receivedDateTime ge …`) so the pre-go-live backlog is never even fetched — it stays untouched in the inbox rather than being ticketed/auto-replied. (Without this, the oldest-first drain would process that backlog first.) A per-message guard backstops the always-included triggering id.
    - **Replays the `MAIL_REPROCESS_FOLDER`** (default `Reprocess`, created on demand): every drain also scans this folder — drop a message into it (e.g. one that arrived during an outage or was filed too soon) and the next drain replays it through the full pipeline **as if it just arrived**. Reprocess intentionally **bypasses the `MAIL_IGNORE_BEFORE` cutoff** and **sends no customer auto-reply** (it only creates/updates the ticket); the message is then moved to `MAIL_PROCESSED_FOLDER` like normal mail. Pickup latency is one sweep cycle (`MAIL_SWEEP_CRON`, ≤15 min by default) since moving mail into a folder raises no inbox notification.
    - Fetches the message (plain-text body via `Prefer: outlook.body-content-type="text"`) and its attachments via Graph.
-   - Ignores loop/system senders (the hash domain, `helpdesk.com`, the `onmicrosoft.com` tenant).
+   - Ignores loop/system senders (`helpdesk.com`, the `onmicrosoft.com` tenant) and bounce senders (`postmaster@`/`mailer-daemon@`, exact local part, any domain).
    - **Never dispatches to one of our own drain mailboxes**: any outbound (ack or agent reply) addressed to a `MAILBOX_ADDRESSES` mailbox — by exact match, *or* the same mailbox under an alias company domain (`corespecialty.com` / `corespecialtyins.com`, set by `RELAY_IN_SCOPE_DOMAINS`), e.g. `escape@corespecialty.com` for a configured `escape@corespecialtyins.com` — is suppressed, otherwise it would land back in a drained inbox, open a fresh ticket, and ping-pong. This is scoped to the drain mailboxes (and their alias-domain spellings), **not** the whole company domain, so ordinary internal requesters still get replies. (Outbound counterpart to the ignored-sender guard.)
    - Looks up the requester's existing tickets and either **updates** a matched ticket or **creates** a new one.
    - Uploads attachments to SharePoint when the combined size is within the limit (see size policy).
-   - Sends a reply-received acknowledgement **only when an inbound updates an existing ticket** — **from the receiving shared mailbox**. A **new** ticket is opened **silently**: no "ticket has been created" notice is sent to the requester, from the relay or from Helpdesk (Helpdesk's own notice is dead-ended by the hashed requester sink).
+   - Sends a reply-received acknowledgement **only when an inbound updates an existing ticket** — **from the receiving shared mailbox**. A **new** ticket is opened **silently**: no "ticket has been created" notice is sent to the requester, from the relay or from Helpdesk (Helpdesk's own requester notifications are disabled in Helpdesk's admin settings, so Helpdesk sends nothing either).
    - When attachments exceed the combined limit: uploads nothing and adds an agent `System note:` describing the overage (the original mail + attachments stay in the mailbox).
    - Sends a debug email on **errors only** (when `SEND_DEBUG_EMAIL=true`).
    - Moves the source message to `MAIL_PROCESSED_FOLDER` so a duplicate notification (whose original message id now 404s) is a no-op. Processing is at-least-once: steps **after the ticket is created/updated** (and the reply ack, when one is sent) are best-effort so a late failure can't trigger a reprocess that duplicates the ticket or re-acks.
 
-Ticket matching prefers the `[#shortID]` threading tag in the subject, then falls back to a guarded subject-substring match (an empty ticket subject never matches). See **Subject Threading & Requester Encoding**.
+Ticket matching prefers the `[#shortID]` threading tag in the subject, then falls back to a guarded subject-substring match (an empty ticket subject never matches). See **Subject Threading & Requester Addresses**.
 
 Auth: the function key / APIM `subscription-key` is carried in the query string of `GRAPH_NOTIFICATION_URL` (Graph calls the exact URL, and appends `&validationToken=...` on validation). Treat the full notification URL (with key) as a secret.
 
@@ -103,7 +102,7 @@ Helpdesk → APIM → helpdesk function → Graph sendMail (from the shared mail
 Registered webhook events: `tickets.create`, `tickets.update`.
 
 The `helpdesk` function:
-- On `tickets.create` from the Helpdesk UI: patches `customFields.email` with the decoded requester address, and emails the requester **only when the create's last event is agent-authored**. Customer-emails-in (client-authored) are already handled by `process-mail`, so they are **not echoed back**.
+- On `tickets.create` from the Helpdesk UI: patches `customFields.email` with the requester address, and emails the requester **only when the create's last event is agent-authored**. Customer-emails-in (client-authored) are already handled by `process-mail`, so they are **not echoed back**.
 - On `tickets.update`: emails the requester when the last event is **agent-authored**, not sourced from email, not a private message, and not a `System note:`.
 - Sends the agent's reply **text only** (Graph `sendMail`) — attachments are not forwarded to the requester.
 - Does not update ticket status; does not create private notes.
@@ -112,13 +111,13 @@ Webhook endpoint: `/api/helpdesk` (behind APIM), auth via the `subscription-key`
 
 ---
 
-# Subject Threading & Requester Encoding
+# Subject Threading & Requester Addresses
 
 **Subject threading (`subject.ts`).** Outbound mail embeds a `[#<shortID>]` tag in the subject. Inbound matching reads that tag first (`extractTicketRef`, last tag wins for forwarded chains) and only falls back to subject-substring comparison when no tag matches. `withTicketRef` strips any existing tags before re-appending, so tags do not accumulate across reply round-trips.
 
-**Requester encoding.** Helpdesk stores the requester as an inbound-hashed address so Helpdesk's own notifications never reach the customer directly — the relay is the sole outbound path. The encoding is reversible and subdomain-safe: the single `@` becomes `=` —
-`john@sub.example.com` → `john=sub.example.com@<RELAY_HASH_DOMAIN>`.
-`decodeRequesterEmail` reverses it on the last `=` (with a legacy `.`-form fallback for older tickets) and passes through any address not under the hash domain. **Keep `RELAY_HASH_DOMAIN`'s value stable** so already-created tickets keep decoding; the domain should be one with no real mailbox so Helpdesk mail to it goes nowhere.
+**Requester addresses.** The customer's real email address is stored unaltered as the Helpdesk ticket requester, and mirrored into `customFields.email` — the field the webhook sends agent replies to. This is safe **only because Helpdesk's own requester notifications are disabled in Helpdesk's admin settings** — the relay is the sole sender of customer email (reply-received ack for existing tickets, agent replies via the webhook). **Re-enabling Helpdesk's requester notifications would double-email customers on every event.**
+
+**Transition note (2026-08).** Tickets created before this change carry a hashed requester (`<local>=<domain>@<old sink domain>`, e.g. `john=example.com@…`). Replies to those threads miss the requester-email lookup and open a new ticket (agents merge by hand), and stale hashed **contacts** in Helpdesk's contact database must not be linked to new UI tickets — agent replies to them bounce silently at the dead sink domain until the ticket's `email` custom field is corrected.
 
 ---
 
@@ -272,7 +271,6 @@ a4301167-ec24-46c0-98ae-ea3299a60d07 corespecialty-ticket-update     https://api
 | `GRAPH_HTTP_TIMEOUT_MS` | Per-request timeout for normal Graph calls (default `60000`). |
 | `GRAPH_TRANSFER_TIMEOUT_MS` | Per-request timeout for attachment download/upload transfers (default `300000`). |
 | `HELPDESK_HTTP_TIMEOUT_MS` | Per-request timeout for Helpdesk calls (default `60000`). |
-| `RELAY_HASH_DOMAIN` | Requester-hash sink domain + loop guard. **Required** (no built-in default; the relay throws without it). |
 | `SPO_SITE_URL` | Full SharePoint site URL. |
 | `SPO_LIBRARY_NAME` | Target document library name. |
 | `HELPDESK_PAT` | Helpdesk Personal Access Token (Key Vault reference). |
@@ -326,7 +324,6 @@ npm run test:coverage
 | Test file | Focus |
 |-----------|-------|
 | `subject.test.ts` | `[#shortID]` tag extraction / strip-and-append / normalization |
-| `requester-hash.roundtrip.test.ts` | `toInboundHashedEmail` ↔ `decodeRequesterEmail` round-trip |
 | `routing.test.ts` | inbox normalization, team routing, inbound loop guard |
 | `helpdesk-client.test.ts` | client base URL/auth, ticket op body shapes, `findExistingTicket` matching |
 | `graph-mail.test.ts` | `parseGraphMessage`, `listMessageAttachments`/`fetchAttachmentBytes`, `sendMailViaGraph` shape, oversize builder |
