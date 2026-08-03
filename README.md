@@ -214,12 +214,9 @@ relay's non-Entra secrets (`HELPDESK_PAT`, `GRAPH_SUBSCRIPTION_CLIENT_STATE`).
 
 **Team sync (AAD security groups → Helpdesk teams/roles):**
 - `sync-teams` (timer, `TEAM_SYNC_CRON`, default hourly; **not** `runOnStartup`, since it can delete agents) reconciles Helpdesk **agents** from AAD security groups. Helpdesk has no team-membership resource — a team is a set of agents and membership lives as a `teamIDs` array on each agent — so the sync PATCHes agents. The group→team/role mapping is **hardcoded per environment** in [`src/functions/team-mapping.ts`](src/functions/team-mapping.ts) (`RULES_BY_ENV`) — like `routing.ts`'s `TEAM_BY_INBOX`, so the mapping (incl. the privileged `owner` grant) is reviewed in PRs rather than living in deploy vars. The active table is selected by the **`RELAY_ENVIRONMENT`** app setting (injected from the deploy matrix: `Production` | `Development`), defaulting to the **Development** table when unset/unknown so a misconfigured deploy can never run Production's reconcile. The `Development` table is a **reduced, dev-only rule set** (separate from Production) so the Dev app never mutates Production's teams. Each rule maps an AAD group **object ID** → a Helpdesk **team ID** + **role** (`owner`=Admin / `normal`=Agent / `viewer`); a rule may omit `team` (a role-only group, e.g. Viewers). Each member accumulates the union of roles + teams across their groups; the most-privileged role (`owner > normal > viewer`) is used when inviting.
-  - **New member, no agent** → invite via `POST /agents` (Helpdesk creates them `invited` and mails the invite; the create schema rejects an explicit `status`). **In a mapped group** → add that team. **Left a mapped group** → remove that team. **Scope is "mapped teams only"** — an agent's manually-assigned (non-mapped) teams are never touched, and add/remove is strictly per-team (leaving Group A never removes you from Team B).
+  - **New member, no agent** → invite via `POST /agents` (status `TEAM_SYNC_INVITE_STATUS`, default `invited`). **In a mapped group** → add that team. **Left a mapped group** → remove that team. **Scope is "mapped teams only"** — an agent's manually-assigned (non-mapped) teams are never touched, and add/remove is strictly per-team (leaving Group A never removes you from Team B).
   - **Decommission (DELETE)** happens only when an agent ends up in **no mapped group AND zero Helpdesk teams** (mapped *and* manual) — i.e. fully orphaned; a member still in any group/team (e.g. a viewer, or someone on another team) is never deleted. With `TEAM_SYNC_CLEANUP_ORPHANS` on (default), this also reaps **pre-existing** zero-team / no-group agents (a true-up), not just ones de-teamed this run. **`TEAM_SYNC_PROTECTED_AGENTS`** emails are never deleted (and left fully untouched rather than stranded) — use it for the account owner / break-glass admins. Orphan cleanup is **suppressed for the whole run if any group read fails** (can't trust "in no group" on incomplete data).
   - **Safety rails:** a group that reads **empty or errors** has its team's removals **suppressed** (can't tell a legit-empty group from a bad read). Total removals per run are capped by `TEAM_SYNC_MAX_REMOVALS` (default 5); over the cap, **all** removals/deletes are skipped that run (logged at ERROR) while adds still apply. Set `TEAM_SYNC_DRY_RUN=true` to log the intended changes without applying — recommended for the first run; then trigger the timer manually to verify.
-  - **Failures email a human — routed by category, throttled to once a day** ([`src/functions/alerts.ts`](src/functions/alerts.ts) is the shared engine; the sync wires up two alert *definitions* on top of it). Every alert has a **category**, and each category routes to one Helpdesk team per environment (`ALERT_TEAMS_BY_ENV` in `team-mapping.ts` — kept next to the group rules so all hardcoded team IDs are PR-reviewed in one place). Recipients are the routed team's members on the agent list the sync already fetched (zero extra API calls, loop-guarded so a drain mailbox is never mailed); mail is sent from the **Escape mailbox** (`ALERT_FROM_MAILBOX`). Each alert is **throttled to one mail per environment + throttle key per Eastern day** by a create-once blob (`If-None-Match: *`) in the `relay-state` container — atomic, so it holds across instances. Alerts are best-effort: they never change the sync's own outcome, and the underlying failures still fail the run. If every send fails, the day's claim is released so the next hourly run retries; on a storage error the alert fails **closed** (no mail — hourly mail is worse than one missed mail that is already an ERROR trace). Kill switches (flippable app settings, no redeploy): `ALERT_ENABLED` (all), `ALERT_IT_ENABLED` / `ALERT_LICENSING_ENABLED` (per category). Adding a new alert = a small definition module calling `sendAlert` with a category + throttle key; a new category additionally needs a row in `ALERT_TEAMS_BY_ENV`.
-    - **`licensing` → the Management team** ([`src/functions/seat-alert.ts`](src/functions/seat-alert.ts)): out of agent licenses. Helpdesk exposes no seat/quota endpoint, so the relay only discovers a full account by trying: `POST /agents` returns `409 {"error":{"type":"limitExceeded","message":"agents count (15) is greater than subscription allows (14)","details":{"lackingSeats":1}}}`. That's a business condition only a licence purchase fixes; the mail names every blocked user and the seat shortfall. Detection keys on the error **`type`**, not the 409 status (`POST /agents` also 409s on a duplicate email). Stable throttle key `seat-limit` (the condition persists until a purchase). **Only Production maps a licensing team** — Development sends no licensing mail (it shares the Helpdesk account with Production, so a Dev-mapped team would mail Production's managers); the condition is logged at ERROR regardless.
-    - **`it` → the Development / IT Support team** ([`src/functions/sync-failure-alert.ts`](src/functions/sync-failure-alert.ts)): every **non-seat** failure in a run — invite/update/delete rejections (422 schema drift, 5xx) and failed AAD group reads — digested into one mail. The throttle key embeds a coarse **failure signature** (sorted distinct `op`+`status` pairs, e.g. `sync-failure-invite422`), so a persistent failure mails once a day but a *new* failure mode appearing later the same day still alerts. Mapped in **both** environments (the subject/body name the environment) — a failing Dev sync is exactly what this team wants to hear about.
 
 **Storage Queue:** `mail-notifications` on the Function App's storage account (`AzureWebJobsStorage`); failures past `maxDequeueCount` dead-letter to `mail-notifications-poison`, monitored by the `mail-poison` trigger.
 
@@ -292,54 +289,13 @@ a4301167-ec24-46c0-98ae-ea3299a60d07 corespecialty-ticket-update     https://api
 | `TEAM_SYNC_PROTECTED_AGENTS` | Comma-separated emails the sync will never delete (owner / break-glass admins). |
 | `TEAM_SYNC_MAX_REMOVALS` | Max team removals/deletes applied per run before all removals are skipped that run (default `5`). |
 | `TEAM_SYNC_DEFAULT_ROLE` | Role used when a rule omits `role` (default `normal`). |
+| `TEAM_SYNC_INVITE_STATUS` | Status for newly invited agents (default `invited`). |
 | `TEAM_SYNC_DRY_RUN` | Set to `true` to log intended team-sync changes without applying them. Recommended for the first run. |
-| `ALERT_ENABLED` | Set to `false` to silence ALL relay email alerts (default on; the conditions are still logged at ERROR). Read per-invocation — flips via an app setting with no redeploy. |
-| `ALERT_IT_ENABLED` / `ALERT_LICENSING_ENABLED` | Per-category kill switches (default on): `it` = sync failures to the Development / IT Support team; `licensing` = seat exhaustion to the Management team. Same per-invocation read as `ALERT_ENABLED`. |
-| `ALERT_FROM_MAILBOX` | Shared mailbox alerts are sent as (default `escape@corespecialty.com`). Must be covered by the Exchange Application Access Policy. |
-| `ALERT_CONTAINER` | Blob container holding the once-per-day alert claims (default `relay-state`, on the `AzureWebJobsStorage` account). |
-| `ALERT_TIME_ZONE` | IANA zone defining an alert's "day" (default `America/New_York`, so the daily reset matches the business day rather than 8 PM ET). |
 | `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` / `AZURE_FUNC_APP_SUBSCRIPTION` / `AZURE_FUNCTION_NAME` | Deployment/auth tooling. |
 
 Key Vault-linked: `GRAPH_SUBSCRIPTION_CLIENT_STATE`, `HELPDESK_PAT` (resolved by the managed identity). No Graph client secret is used anywhere — auth is the app registration federated by the user-assigned managed identity.
 
 App-setting values (non-secret) are supplied at deploy time from `Deploy.yml` (`vars.*`).
-
----
-
-# LiveChat Transcript Backlog Export
-
-[`scripts/Export-LiveChatTranscripts.ps1`](scripts/Export-LiveChatTranscripts.ps1)
-downloads archived LiveChat threads through the Text Agent Chat API v3.6
-[`list_archives`](https://platform.text.com/docs/messaging/agent-chat-api/#list-archives)
-action. It writes complete JSON records, readable text transcripts, and a CSV
-manifest under `<output>/<year>/<month>/`. Existing transcripts are skipped, so
-an interrupted backlog export can be resumed by running the same command again.
-
-Create a Text Personal Access Token with `chats--all:ro` (all groups) or
-`chats--access:ro` (the token owner's groups), then use either the Base64
-credential shown by the Developer Console:
-
-```powershell
-$env:LIVECHAT_BASIC_TOKEN = '<base64 credential>'
-.\scripts\Export-LiveChatTranscripts.ps1 -FromMonth 2024-01
-```
-
-or the raw account ID and token:
-
-```powershell
-$env:LIVECHAT_ACCOUNT_ID = '<account id>'
-$env:LIVECHAT_PAT = '<personal access token>'
-.\scripts\Export-LiveChatTranscripts.ps1 `
-    -FromMonth 2024-01 `
-    -ToMonth 2025-12 `
-    -OutputPath D:\Exports\LiveChat
-```
-
-The default output folder, `livechat-transcripts/`, is gitignored because the
-exports contain customer data. Use `Get-Help` on the script for group filters,
-JSON-only output, overwrite behavior, and all other options. File events and
-their URLs are preserved in the transcript; attached file contents are not
-downloaded.
 
 ---
 

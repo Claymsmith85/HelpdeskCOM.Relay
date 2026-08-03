@@ -1,0 +1,267 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - '**/*.ts'
+      - '**/*.json'
+      - '.github/workflows/Deploy.yml'
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - '**/*.ts'
+      - '**/*.json'
+      - '.github/workflows/Deploy.yml'
+  workflow_dispatch:
+
+env:
+  SOURCE_DIRECTORY: .
+  NODE_VERSION: '24.0.x'
+  ARTIFACT_NAME: drop
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    runs-on:
+      group: organization/corespecialty
+      labels: self-hosted
+    outputs:
+      artifact_name: ${{ env.ARTIFACT_NAME }}
+    steps:
+#      - name: Harden Runner
+#        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594
+#        with:
+#          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+
+      - name: npm build
+        id: npm-build
+        uses: corespecialty/.github-workflows/actions/npm-build@v2.12
+        with:
+          artifact_name: ${{ env.ARTIFACT_NAME }}
+          run_lint: 'false'
+          clean_install: 'true' # npm ci
+          source_directory: ${{ env.SOURCE_DIRECTORY }}
+          node_version: ${{ env.NODE_VERSION }}
+          cache_dependency_path: '${{ github.workspace }}/package-lock.json'
+
+      - name: Stage deployable Functions package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf stage
+          mkdir -p stage
+
+          # Required Azure Functions app root files
+          cp host.json stage/
+          cp package.json stage/
+          cp package-lock.json stage/
+
+          cp -R node_modules stage/node_modules
+
+          # Copy build items
+          cp -R build stage/build
+
+          echo "Staged package:"
+          ls -la stage
+          echo "Confirming build:"
+          node -e "const p=require('./stage/package.json'); console.log('main=',p.main)"
+
+      - name: Upload deploy artifact (drop)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: stage
+          if-no-files-found: error
+          overwrite: true
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
+    runs-on:
+      group: organization/corespecialty
+      labels:
+        - self-hosted
+        - ${{ matrix.environment }}
+    strategy:
+      matrix:
+        environment: ${{ github.ref == 'refs/heads/main' && fromJSON('["Production"]') || fromJSON('["Development"]') }}
+    environment:
+      name: ${{ matrix.environment }}
+
+
+    steps:
+
+#      - name: Harden Runner
+#        uses: step-security/harden-runner@fa2e9d605c4eeb9fcad4c99c224cee0c6c7f3594
+#        with:
+#          egress-policy: audit
+
+      - name: Download build artifact for inspection
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: ${{ needs.build.outputs.artifact_name }}
+          path: artifact
+      - name: Show artifact tree (must contain host.json at root)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Artifact root contents:"
+          ls -la artifact
+          echo
+          echo "Find host.json:"
+          find artifact -maxdepth 3 -name host.json -print
+          echo
+          echo "Find package.json:"
+          find artifact -maxdepth 3 -name package.json -print
+
+
+      - name: Upload HDC PAT Secret
+        id: hdc-pat-upload
+        uses: corespecialty/.github-workflows/actions/secret-upload@v2.12
+        with:
+          key_vault_name: ${{ vars.KEY_VAULT_NAME }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          secret_array: "HELPDESK_PAT=${{ secrets.HELPDESK_PAT }}"
+
+      - name: Upload Graph subscription clientState Secret
+        id: graph-clientstate-upload
+        uses: corespecialty/.github-workflows/actions/secret-upload@v2.12
+        with:
+          key_vault_name: ${{ vars.KEY_VAULT_NAME }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          secret_array: "GRAPH_SUBSCRIPTION_CLIENT_STATE=${{ secrets.GRAPH_SUBSCRIPTION_CLIENT_STATE }}"
+
+      - name: Upload HDC App Reg Client Secret
+        id: hdc-spo-client-secret-upload
+        uses: corespecialty/.github-workflows/actions/secret-upload@v2.12
+        with:
+          key_vault_name: ${{ vars.KEY_VAULT_NAME }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy FuncApp - HDC (deploy the build artifact)
+        id: function-deploy
+        uses: corespecialty/.github-workflows/actions/function-deploy@v2.12
+        with:
+          artifact_name: ${{ needs.build.outputs.artifact_name }}
+          azure_webapp_name: ${{ vars.AZURE_FUNCTION_NAME }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_FUNC_APP_SUBSCRIPTION }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          app_settings: |
+            [
+              {
+                "name": "HELPDESK_PAT",
+                "slotSetting": false,
+                "value": "${{ steps.hdc-pat-upload.outputs.secret_refs_webapp }}"
+              },
+              {
+                "name": "GRAPH_SUBSCRIPTION_CLIENT_STATE",
+                "slotSetting": false,
+                "value": "${{ steps.graph-clientstate-upload.outputs.secret_refs_webapp }}"
+              },
+              {
+                "name": "GRAPH_BASE_URL",
+                "slotSetting": false,
+                "value": "${{ vars.GRAPH_BASE_URL }}"
+              },
+              {
+                "name": "GRAPH_CLIENT_ID",
+                "slotSetting": false,
+                "value": "${{ vars.SPO_CLIENT_ID }}"
+              },
+              {
+                "name": "GRAPH_TENANT_ID",
+                "slotSetting": false,
+                "value": "${{ vars.SPO_TENANT_ID }}"
+              },
+              {
+                "name": "MANAGED_IDENTITY_CLIENT_ID",
+                "slotSetting": false,
+                "value": "${{ vars.MANAGED_IDENTITY_CLIENT_ID }}"
+              },
+              {
+                "name": "SPO_LIBRARY_NAME",
+                "slotSetting": false,
+                "value": "${{ vars.SPO_LIBRARY_NAME }}"
+              },
+              {
+                "name": "SPO_SITE_URL",
+                "slotSetting": false,
+                "value": "${{ vars.SPO_SITE_URL }}"
+              },
+              {
+                "name": "RELAY_HASH_DOMAIN",
+                "slotSetting": false,
+                "value": "${{ vars.RELAY_HASH_DOMAIN }}"
+              },
+              {
+                "name": "MAILBOX_ADDRESSES",
+                "slotSetting": false,
+                "value": "${{ vars.MAILBOX_ADDRESSES }}"
+              },
+              {
+                "name": "GRAPH_NOTIFICATION_URL",
+                "slotSetting": false,
+                "value": "${{ vars.GRAPH_NOTIFICATION_URL }}"
+              },
+              {
+                "name": "MAIL_PROCESSED_FOLDER",
+                "slotSetting": false,
+                "value": "${{ vars.MAIL_PROCESSED_FOLDER }}"
+              },
+              {
+                "name": "MAIL_QUEUE_NAME",
+                "slotSetting": false,
+                "value": "${{ vars.MAIL_QUEUE_NAME }}"
+              },
+              {
+                "name": "DEBUG_EMAIL_TO",
+                "slotSetting": false,
+                "value": "${{ vars.DEBUG_EMAIL_TO }}"
+              },
+              {
+                "name": "SEND_DEBUG_EMAIL",
+                "slotSetting": false,
+                "value": "${{ vars.SEND_DEBUG_EMAIL }}"
+              },
+              {
+                "name": "RELAY_ENVIRONMENT",
+                "slotSetting": false,
+                "value": "${{ matrix.environment }}"
+              },
+              {
+                "name": "TEAM_SYNC_DRY_RUN",
+                "slotSetting": false,
+                "value": "${{ vars.TEAM_SYNC_DRY_RUN }}"
+              },
+              {
+                "name": "TICKETING_TOGGLE",
+                "slotSetting": false,
+                "value": "${{ vars.TICKETING_TOGGLE }}"
+              },
+              {
+                "name": "USERMGMT_TOGGLE",
+                "slotSetting": false,
+                "value": "${{ vars.USERMGMT_TOGGLE }}"
+              },
+                            {
+                "name": "TEAM_SYNC_CRON",
+                "slotSetting": false,
+                "value": "${{ vars.TEAM_SYNC_CRON }}"
+              }
+            ]
