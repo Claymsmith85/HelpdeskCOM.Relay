@@ -4,7 +4,9 @@
 //   - the auto-reply email sent back to people who reply to an existing ticket (a NEW ticket is
 //     opened silently — no "ticket created" notice is sent),
 //   - the email that carries an agent's reply,
-//   - the ticket message snippets the relay writes (uploaded-attachment list + oversize note).
+//   - the ticket message snippets the relay writes (uploaded-attachment list + oversize note),
+//   - the follower / people-in-the-loop notice emails (ticket-notices.ts), plus the
+//     "[Relayed from …]" marker pair — builder AND parser live here together so they can't drift.
 // Pure string-building — no I/O — so it is freely importable and unit-testable. Outbound subjects
 // are threaded with the "[#shortID]" tag via subject.ts so replies match back to their ticket.
 import { withTicketRef } from "./subject";
@@ -94,4 +96,83 @@ export function buildOversizeCommentText(opts: {
 /** Convert bytes to a mebibytes string for messaging. */
 function formatMiB(bytes: number): string {
   return (bytes / (1024 * 1024)).toFixed(2);
+}
+
+// ---- Follower / people-in-the-loop notices (consumed by ticket-notices.ts) ----
+
+/**
+ * First line the inbound worker prefixes onto a ticket message that a NON-requester (a follower or
+ * person-in-the-loop) threaded in by replying to a notice. Two jobs: attribute the message in the
+ * Helpdesk UI (the API author is a generic "client"), and let the webhook's notice pass exclude
+ * the sender from the notice about their own message (parseRelayedFrom below).
+ */
+export function relayedFromMarker(email: string): string {
+  return `[Relayed from ${email.trim()}]`;
+}
+
+const RELAYED_FROM_RE = /^\[Relayed from ([^\s\]]+@[^\s\]]+)\]\s*$/;
+
+/**
+ * Parse the relayed-from marker off a ticket message's FIRST line only (a marker quoted deeper in
+ * a reply chain must not count). Returns the lowercased email, or null when the text doesn't start
+ * with a marker.
+ */
+export function parseRelayedFrom(text: string | null | undefined): string | null {
+  const firstLine = (text ?? "").split("\n", 1)[0] ?? "";
+  const m = RELAYED_FROM_RE.exec(firstLine.trim());
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Notice for a message event on a ticket (agent reply, customer reply, private note, system note).
+ * The subject is threaded so a recipient's reply matches back into the SAME ticket (the inbound
+ * worker threads tagged non-requester replies when NOTICES_TOGGLE is on).
+ */
+export function noticeMessageEmail(opts: {
+  ticketSubject: string;
+  shortId: string | null | undefined;
+  ref: string;
+  authorLabel: string; // who wrote it — agent name, relayed-from email, or the requester's name
+  text: string;
+  isPrivate: boolean;
+  isSystemNote: boolean;
+}): EmailContent {
+  const { ticketSubject, shortId, ref, authorLabel, text, isPrivate, isSystemNote } = opts;
+  const kind = isSystemNote ? "system note" : isPrivate ? "private note" : "reply";
+  return {
+    subject: withTicketRef(`Re: ${ticketSubject}`, shortId),
+    body: `${authorLabel} added a ${kind} to ticket ${ref}:\n\n${text}`,
+  };
+}
+
+/** Notice for a ticket status change. */
+export function noticeStatusEmail(opts: {
+  ticketSubject: string;
+  shortId: string | null | undefined;
+  ref: string;
+  oldStatus: string;
+  newStatus: string;
+}): EmailContent {
+  const { ticketSubject, shortId, ref, oldStatus, newStatus } = opts;
+  return {
+    subject: withTicketRef(`Re: ${ticketSubject}`, shortId),
+    body: `Ticket ${ref} status changed: ${oldStatus} -> ${newStatus}.`,
+  };
+}
+
+/** Notice for a ticket assignment change (followers only — names internal agents/teams). */
+export function noticeAssignmentEmail(opts: {
+  ticketSubject: string;
+  shortId: string | null | undefined;
+  ref: string;
+  newTeam?: string;
+  newAgent?: string;
+}): EmailContent {
+  const { ticketSubject, shortId, ref, newTeam, newAgent } = opts;
+  const team = newTeam || "unassigned";
+  const agent = newAgent || "unassigned";
+  return {
+    subject: withTicketRef(`Re: ${ticketSubject}`, shortId),
+    body: `Ticket ${ref} was reassigned — team: ${team}, agent: ${agent}.`,
+  };
 }

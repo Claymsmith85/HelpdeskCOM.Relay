@@ -12,7 +12,7 @@ import { AxiosError, AxiosInstance } from "axios";
 
 import { createGraphClientFromEnv, graphConfigFromEnv } from "./graph-client";
 import { acquireDrainLock } from "./drain-lock";
-import { envInstantMs, envPositiveNumber, ticketingEnabled } from "./env";
+import { envInstantMs, envPositiveNumber, noticesEnabled, ticketingEnabled } from "./env";
 import { MAIL_QUEUE_NAME, mailQueueOutput, type MailQueueItem } from "./mail-queue";
 import {
   getMessage,
@@ -40,6 +40,7 @@ import {
   existingTicketAutoReply,
   appendFolderAndFilenamesToBody,
   buildOversizeCommentText,
+  relayedFromMarker,
 } from "./templates";
 import {
   createHelpdeskClient,
@@ -48,8 +49,10 @@ import {
   updateTicketMessage,
   createTicket,
   findExistingTicket,
+  findTicketByShortId,
   type TicketSummary,
 } from "./helpdesk-client";
+import { extractTicketRef } from "./subject";
 import { normalizeInbox, normalizeMailboxKey, routeTeam, shouldIgnoreSender, shouldSuppressRecipient } from "./routing";
 import {
   createBufferedLogger,
@@ -414,13 +417,38 @@ async function processSingleMessage(
 
   step("Helpdesk: listTicketsByRequester begin");
   const tickets = await listTicketsByRequester(helpdesk, parsed.fromAddress);
-  const existingTicket = findExistingTicket(parsed.subject, tickets);
+  let existingTicket: TicketSummary | null = findExistingTicket(parsed.subject, tickets);
   step("Helpdesk: ticket lookup", {
     requester: parsed.fromAddress,
     count: tickets.length,
     found: !!existingTicket,
     ticketId: existingTicket?.ID ?? null,
   });
+
+  // Non-requester reply threading (NOTICES_TOGGLE): a follower / person-in-the-loop replying to a
+  // notice carries the [#shortID] tag, but the sender-scoped lookup above can't see the ticket
+  // (they aren't its requester) — without this, their reply opens a duplicate ticket. The by-ref
+  // lookup runs BEFORE any side effect (a 5xx rethrows -> queue retry, never a mis-filed reply);
+  // the marker is only attached when the sender genuinely isn't the requester (a paging miss in
+  // the requester-scoped list would otherwise mislabel the requester's own reply).
+  let relayedFrom: string | undefined;
+  if (!existingTicket && noticesEnabled()) {
+    const ref = extractTicketRef(parsed.subject);
+    if (ref) {
+      const byRef = await findTicketByShortId(helpdesk, ref);
+      step("Helpdesk: ticket lookup by subject ref", {
+        ref,
+        found: !!byRef,
+        ticketId: byRef?.ID ?? null,
+      });
+      if (byRef) {
+        existingTicket = byRef;
+        const sender = (parsed.fromAddress ?? "").trim().toLowerCase();
+        const requester = (byRef.requesterEmail ?? "").trim().toLowerCase();
+        if (sender && sender !== requester) relayedFrom = parsed.fromAddress;
+      }
+    }
+  }
 
   const mailboxAddress = await resolveMailboxAddress(graph, mailbox);
   const normalizedInbox = normalizeInbox(mailboxAddress ?? parsed.toAddress);
@@ -430,7 +458,7 @@ async function processSingleMessage(
   if (existingTicket) {
     await handleExistingTicket({
       graph, helpdesk, mailbox, parsed, existingTicket, uploadItems,
-      blocked: plan.blocked, suppressAck: reprocess, step, stepError,
+      blocked: plan.blocked, suppressAck: reprocess, relayedFrom, step, stepError,
     });
   } else {
     await handleNewTicket({
@@ -481,16 +509,24 @@ async function handleExistingTicket(opts: {
   uploadItems: SharePointUploadItem[];
   blocked: AttachmentMeta[];
   suppressAck: boolean;
+  /** Set when a NON-requester's tagged reply was threaded in — prefixes the relayed-from marker. */
+  relayedFrom?: string;
   step: StepFn;
   stepError: StepErrorFn;
 }): Promise<void> {
-  const { graph, mailbox, helpdesk, parsed, existingTicket, uploadItems, blocked, suppressAck, step, stepError } = opts;
+  const { graph, mailbox, helpdesk, parsed, existingTicket, uploadItems, blocked, suppressAck, relayedFrom, step, stepError } = opts;
 
   const { folderWebUrl, uploadedLinks } = await uploadToTicket({
     helpdesk, ticketId: existingTicket.ID, fromAddress: parsed.fromAddress, uploadItems, step, stepError,
   });
 
-  const messageText = buildTicketMessageText(parsed.text, uploadedLinks, folderWebUrl);
+  // The marker line attributes a threaded non-requester reply in the Helpdesk UI (the API author
+  // is a generic "client") AND lets the webhook's notice pass exclude the sender from the notice
+  // about their own message (templates.ts's marker pair).
+  const baseText = relayedFrom
+    ? `${relayedFromMarker(relayedFrom)}\n\n${parsed.text}`
+    : parsed.text;
+  const messageText = buildTicketMessageText(baseText, uploadedLinks, folderWebUrl);
   await updateTicketMessage({ helpdesk, ticketId: existingTicket.ID, text: messageText, authorType: "client" });
 
   // Reprocess replays the ticket message but suppresses the customer ack (the original send already

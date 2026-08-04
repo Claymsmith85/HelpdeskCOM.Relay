@@ -89,6 +89,8 @@ Sender → native shared mailbox (Inbox)
 
 Ticket matching prefers the `[#shortID]` threading tag in the subject, then falls back to a guarded subject-substring match (an empty ticket subject never matches). See **Subject Threading & Requester Addresses**.
 
+With **`NOTICES_TOGGLE`** on, a tagged reply from a **non-requester** (a follower / person-in-the-loop replying to a notice — invisible to the requester-scoped ticket list) is resolved by shortID (`GET /tickets?shortID=…`, client-side verified so an ignored filter can only miss, never mis-match) and **threads into the original ticket** instead of opening a duplicate, prefixed with a `[Relayed from <sender>]` attribution line (the API author is a generic "client"). The sender still gets the usual reply-received ack. A 4xx on the lookup falls through to a new ticket (the old behavior); a 5xx rethrows before any side effect so the queue retries rather than mis-filing the reply.
+
 Auth: the function key / APIM `subscription-key` is carried in the query string of `GRAPH_NOTIFICATION_URL` (Graph calls the exact URL, and appends `&validationToken=...` on validation). Treat the full notification URL (with key) as a secret.
 
 ---
@@ -106,6 +108,7 @@ The `helpdesk` function:
 - On `tickets.update`: emails the requester when the last event is **agent-authored**, not sourced from email, not a private message, and not a `System note:`.
 - Sends the agent's reply **text only** (Graph `sendMail`) — attachments are not forwarded to the requester.
 - Does not update ticket status; does not create private notes.
+- **Follower / people-in-the-loop notices** (`NOTICES_TOGGLE`, default OFF): on every create/update — independently of the requester gates above, so customer replies and status changes count too — the ticket's followers (`payload.followers`, agents) and people-in-the-loop (`payload.cc`, external emails) are emailed about the last event, threaded with the `[#shortID]` tag so their replies match back into the ticket. Visibility: **followers** get everything (public messages, private notes, system notes, status changes, assignment changes); **people-in-the-loop** get public messages and status changes only. Echo control: the requester, the event's author, and the `[Relayed from …]` sender of a threaded reply are never notified, and every recipient passes the outbound loop guard. Best-effort: notice failures never fail the webhook (a non-200 would make Helpdesk redeliver and duplicate email).
 
 Webhook endpoint: `/api/helpdesk` (behind APIM), auth via the `subscription-key` query parameter.
 
@@ -173,6 +176,7 @@ Sent via Microsoft Graph `POST /users/{mailbox}/sendMail` from the relevant shar
 Outbound triggers:
 - Acknowledgement on a **reply that updates an existing ticket** (via `process-mail`). A **new** ticket is opened silently — no "ticket created" notice is sent to the requester.
 - Agent replies, **text only** (via `helpdesk`).
+- Follower / people-in-the-loop notices on ticket events (via `helpdesk`, gated by `NOTICES_TOGGLE` — see the webhook flow above).
 - Debug message (errors only, when `SEND_DEBUG_EMAIL=true`) — sent from a real shared mailbox.
 
 Acknowledgement / agent-reply `from` is the shared mailbox itself (the inbox the mail was addressed to / `customFields.inbox`, defaulting to `escape@corespecialty.com`).
@@ -280,6 +284,7 @@ a4301167-ec24-46c0-98ae-ea3299a60d07 corespecialty-ticket-update     https://api
 | `SEND_DEBUG_EMAIL` | Set to `true` to send the debug email on errors. Unset/empty = off. |
 | `TICKETING_TOGGLE` | **Master switch for all mail-flow interaction. Default OFF** (unset/empty = off). `true`/`on`/`1`/`yes` = on. When off, `process-mail` and the `helpdesk` webhook do nothing — no ticket create/update, no outbound email — and mail is left untouched in the mailbox (caught up on the next drain once re-enabled). Subscription renewal + inbox sweep keep running. |
 | `USERMGMT_TOGGLE` | **Master switch for `sync-teams` user/team management. Default OFF** (unset/empty = off). `true`/`on`/`1`/`yes` = on. When off, no agent invite/update/delete is attempted; the next enabled run reconciles from live state. |
+| `NOTICES_TOGGLE` | **Follower / people-in-the-loop notices + non-requester reply threading. Default OFF** (unset/empty = off; same value parsing). One flag gates both halves (they form one conversation loop). Sub-toggle of `TICKETING_TOGGLE`. |
 | `SUBSCRIPTION_RENEW_CRON` | Optional override for the renewal timer (default `0 0 */6 * * *`). |
 | `MAIL_SWEEP_CRON` | Optional override for the safety-net sweep timer (default `0 */15 * * * *`, every 15 min). |
 | `RELAY_ENVIRONMENT` | Selects the team-sync mapping table in `team-mapping.ts` (`Production` \| `Development`). Injected from the deploy matrix; defaults to the Development table when unset. |
@@ -329,14 +334,16 @@ npm run test:coverage
 |-----------|-------|
 | `subject.test.ts` | `[#shortID]` tag extraction / strip-and-append / normalization |
 | `routing.test.ts` | inbox normalization, team routing, inbound loop guard |
-| `helpdesk-client.test.ts` | client base URL/auth, ticket op body shapes, `findExistingTicket` matching |
+| `helpdesk-client.test.ts` | `findTicketByShortId`: shortID param + client-side verification, 4xx→null / 5xx→throw |
+| `templates.test.ts` | auto-reply / agent-reply / notice email builders, relayed-from marker round-trip |
+| `ticket-notices.test.ts` | notice pass: event classification, defensive follower/cc extraction, per-audience visibility, echo control, per-recipient isolation |
 | `graph-mail.test.ts` | `parseGraphMessage`, `listMessageAttachments`/`fetchAttachmentBytes`, `sendMailViaGraph` shape, oversize builder |
 | `sharepoint.test.ts` | `sanitizeSharePointName` |
 | `sharepoint.e2e.test.ts` | Graph pipeline: credential selection, site + drive resolution, folder create / `409` reuse, small content PUT + chunked session, multi-file orchestration |
 | `process-mail.helpers.test.ts` | attachment per-file policy, body formatting, queue-item parsing |
 | `process-mail.handler.test.ts` | Inbound workflow E2E: ignored sender, new + existing ticket, per-file oversize, multi-attachment upload, idempotency move |
 | `notify.test.ts` | validationToken handshake, clientState reject, resource parse + enqueue |
-| `helpdesk.handler.test.ts` | Webhook workflow E2E: create-branch echo suppression, agent-reply email gates |
+| `helpdesk.handler.test.ts` | Webhook workflow E2E: create-branch echo suppression, agent-reply email gates, notice-pass wiring |
 
 Mocking: `@azure/functions` is mocked to a no-op registry (`app.http` / `app.storageQueue` / `app.timer` / `output.storageQueue`). Graph / Helpdesk HTTP is intercepted with `axios-mock-adapter`, or `./graph-mail` / `./sharepoint` are mocked at the boundary. `@azure/identity` `getToken` is mocked for the SharePoint Graph tests.
 

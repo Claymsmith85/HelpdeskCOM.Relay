@@ -66,6 +66,20 @@ export function userMgmtEnabled(): boolean {
 }
 
 /**
+ * Switch for follower / people-in-the-loop ticket notices AND the non-requester reply threading
+ * that closes their loop (`NOTICES_TOGGLE`). OFF — the default when unset/empty — means the
+ * `helpdesk` webhook sends no follower/cc notices and `process-mail` does not thread a
+ * `[#shortID]`-tagged reply from a non-requester (it opens a new ticket, today's behavior). One
+ * flag gates BOTH halves deliberately: a notice invites a reply, and the reply must thread — the
+ * halves are one conversation loop, so enabling only one is an inconsistent ops state. Sub-toggle
+ * of `ticketingEnabled` (both handlers already return before this is consulted when ticketing is
+ * off). Default-OFF for the same staged-rollout reason as the other `*_TOGGLE`s.
+ */
+export function noticesEnabled(): boolean {
+  return envFlag(process.env.NOTICES_TOGGLE, false);
+}
+
+/**
  * Parse an instant (any format `Date.parse` accepts — ISO-8601 with a `Z`/offset is safest) from
  * an env value into epoch milliseconds, falling back to `fallbackIso` when the value is
  * missing/unparseable. Used for cutoff-style settings (e.g. "ignore mail received before go-live").

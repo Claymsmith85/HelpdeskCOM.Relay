@@ -2,7 +2,7 @@
 // Helpdesk.com REST client + the ticket operations both functions need. Centralizing this
 // (a) honors HELPDESK_BASE_URL everywhere, (b) derives auth in one place, and (c) keeps the
 // inbound worker and the webhook handler from re-implementing Helpdesk HTTP calls.
-import axios, { AxiosInstance } from "axios";
+import axios, { AxiosError, AxiosInstance } from "axios";
 import { ListTicketsResponse } from "../types/ListTicketsResponse";
 import { extractTicketRef, normalizeRef } from "./subject";
 import { attachRetryInterceptor } from "./http-retry";
@@ -59,6 +59,51 @@ export async function listTicketsByRequester(
     params: { requester: { email: requesterEmail } },
   });
   return res.data ?? [];
+}
+
+// Narrow read type for the by-shortID lookup below (the full list response is much larger).
+type TicketByRefRead = {
+  ID: string;
+  shortID?: string;
+  subject?: string;
+  requester?: { email?: string | null } | null;
+};
+
+/**
+ * Find a ticket by its shortID (the `[#shortID]` threading tag), for inbound replies from a
+ * NON-requester (follower / person-in-the-loop) whose sender-scoped lookup can't see the ticket.
+ *
+ * The `shortID` query param may or may not be honored by the API — so the result is ALWAYS
+ * verified client-side (`normalizeRef` match on the returned bare array). If the API ignores the
+ * param and the ticket isn't in the returned page, this returns null and the caller falls through
+ * to today's new-ticket behavior — a miss is safe, a wrong match never happens.
+ *
+ * Errors: a definitive 4xx returns null (fall through); a 5xx/transport error (post-retry)
+ * RETHROWS so the queue retries the message instead of mis-filing the reply into a new ticket.
+ */
+export async function findTicketByShortId(
+  helpdesk: AxiosInstance,
+  shortId: string
+): Promise<(TicketSummary & { requesterEmail: string | null }) | null> {
+  let list: TicketByRefRead[];
+  try {
+    const res = await helpdesk.get<TicketByRefRead[]>("/tickets", {
+      params: { shortID: shortId },
+    });
+    list = Array.isArray(res.data) ? res.data : [];
+  } catch (e) {
+    const status = (e as AxiosError)?.response?.status;
+    if (status && status >= 400 && status < 500) return null;
+    throw e;
+  }
+  const match = list.find((t) => normalizeRef(t.shortID) === normalizeRef(shortId));
+  if (!match) return null;
+  return {
+    ID: match.ID,
+    shortID: match.shortID ?? shortId,
+    subject: match.subject ?? "",
+    requesterEmail: match.requester?.email ?? null,
+  };
 }
 
 /**

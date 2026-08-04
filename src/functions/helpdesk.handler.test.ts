@@ -22,13 +22,21 @@ jest.mock("./helpdesk-client", () => ({
   createHelpdeskClient: jest.fn().mockReturnValue({ id: "helpdesk" }),
   patchCustomFields: jest.fn().mockResolvedValue(undefined),
 }));
+// Keep the real isSystemNoteText (the system-note gate tests depend on it); only the notice
+// orchestration is stubbed — its own behavior is covered by ticket-notices.test.ts.
+jest.mock("./ticket-notices", () => ({
+  ...jest.requireActual("./ticket-notices"),
+  sendTicketNotices: jest.fn().mockResolvedValue(undefined),
+}));
 
 import { helpdesk } from "./helpdesk";
 import { sendMailViaGraph } from "./graph-mail";
 import { patchCustomFields } from "./helpdesk-client";
+import { sendTicketNotices } from "./ticket-notices";
 
 const sendMock = sendMailViaGraph as jest.Mock;
 const patchMock = patchCustomFields as jest.Mock;
+const noticesMock = sendTicketNotices as jest.Mock;
 
 function fakeContext() {
   return { log: jest.fn(), invocationId: "test-inv" } as any;
@@ -46,6 +54,7 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.MAILBOX_ADDRESSES;
   delete process.env.TICKETING_TOGGLE;
+  delete process.env.NOTICES_TOGGLE;
 });
 
 describe("TICKETING_TOGGLE (master mail-flow switch)", () => {
@@ -266,5 +275,95 @@ describe("tickets.update", () => {
     sendMock.mockRejectedValueOnce(new Error("graph down"));
     await expect(helpdesk(fakeRequest(updatePayload({})), fakeContext())).resolves.toBeDefined();
     expect(sendMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("follower / people-in-the-loop notice pass (NOTICES_TOGGLE)", () => {
+  // A client-authored, EMAIL-sourced update with no customFields.email: every requester gate
+  // skips it, which is exactly why the notice pass must run before those gates.
+  function clientUpdate() {
+    return {
+      eventType: "tickets.update",
+      payload: {
+        ID: "T3",
+        shortID: "QQ1",
+        subject: "Loop test",
+        source: { type: "api", detailedSource: "api" },
+        requester: { email: "jane@example.com", name: "Jane" },
+        customFields: { email: "", inbox: "escapereferrals@corespecialty.com" },
+        followers: [{ ID: "ag1" }],
+        cc: ["loop@example.com"],
+        events: [
+          { author: { type: "client" }, source: { type: "email" }, message: { text: "Customer says", isPrivate: false } },
+        ],
+      },
+    };
+  }
+
+  it("is not invoked when NOTICES_TOGGLE is unset (default OFF)", async () => {
+    await helpdesk(fakeRequest(clientUpdate()), fakeContext());
+    expect(noticesMock).not.toHaveBeenCalled();
+  });
+
+  it("runs on updates the requester gates would skip (client-authored, email-sourced, no customFields.email)", async () => {
+    process.env.NOTICES_TOGGLE = "true";
+
+    await helpdesk(fakeRequest(clientUpdate()), fakeContext());
+
+    expect(noticesMock).toHaveBeenCalledTimes(1);
+    const arg = noticesMock.mock.calls[0][0];
+    expect(arg.payload.payload.ID).toBe("T3");
+    expect(arg.mailbox).toBe("escapereferrals@corespecialty.com");
+    expect(sendMock).not.toHaveBeenCalled(); // requester flow still correctly skipped
+  });
+
+  it("runs on tickets.create too, and the customFields patch still happens", async () => {
+    process.env.NOTICES_TOGGLE = "true";
+    const payload = clientUpdate() as any;
+    payload.eventType = "tickets.create";
+    payload.payload.source = { type: "email", detailedSource: "helpdesk" };
+
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(noticesMock).toHaveBeenCalledTimes(1);
+    expect(patchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("coexists with the requester email on an agent-authored update", async () => {
+    process.env.NOTICES_TOGGLE = "true";
+    const payload = clientUpdate() as any;
+    payload.payload.customFields.email = "jane@example.com";
+    payload.payload.events = [
+      { author: { type: "agent" }, source: { type: "api" }, message: { text: "Agent reply", isPrivate: false } },
+    ];
+
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(noticesMock).toHaveBeenCalledTimes(1);
+    expect(sendMock).toHaveBeenCalledTimes(1); // requester still emailed
+    expect(sendMock.mock.calls[0][0].to).toBe("jane@example.com");
+  });
+
+  it("falls back to the default inbox when customFields has no inbox", async () => {
+    process.env.NOTICES_TOGGLE = "true";
+    const payload = clientUpdate() as any;
+    delete payload.payload.customFields.inbox;
+
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(noticesMock.mock.calls[0][0].mailbox).toBe("escape@corespecialty.com");
+  });
+
+  it("a notice-pass failure never fails the webhook or the requester email", async () => {
+    process.env.NOTICES_TOGGLE = "true";
+    noticesMock.mockRejectedValueOnce(new Error("notices down"));
+    const payload = clientUpdate() as any;
+    payload.payload.customFields.email = "jane@example.com";
+    payload.payload.events = [
+      { author: { type: "agent" }, source: { type: "api" }, message: { text: "Agent reply", isPrivate: false } },
+    ];
+
+    await expect(helpdesk(fakeRequest(payload), fakeContext())).resolves.toBeDefined();
+    expect(sendMock).toHaveBeenCalledTimes(1); // requester email still went out
   });
 });

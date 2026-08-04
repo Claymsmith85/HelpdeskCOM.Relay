@@ -6,6 +6,11 @@ import {
   agentReplyEmail,
   appendFolderAndFilenamesToBody,
   buildOversizeCommentText,
+  relayedFromMarker,
+  parseRelayedFrom,
+  noticeMessageEmail,
+  noticeStatusEmail,
+  noticeAssignmentEmail,
 } from "./templates";
 import type { AttachmentMeta } from "./graph-mail";
 
@@ -72,5 +77,52 @@ describe("buildOversizeCommentText", () => {
     expect(text).toContain("- huge.zip (120.00 MiB)");
     expect(text).toContain("- big.mov (110.00 MiB)");
     expect(text).toContain("remain in the mailbox");
+  });
+});
+
+describe("relayedFromMarker / parseRelayedFrom", () => {
+  it("round-trips: the parser reads exactly what the builder wrote", () => {
+    const marker = relayedFromMarker("Follower@CoreSpecialty.com");
+    expect(marker).toBe("[Relayed from Follower@CoreSpecialty.com]");
+    expect(parseRelayedFrom(`${marker}\n\nActual reply text`)).toBe("follower@corespecialty.com");
+  });
+
+  it("matches the FIRST line only — a quoted marker deeper in the text does not count", () => {
+    expect(parseRelayedFrom("Reply text\n[Relayed from a@b.co]\nmore")).toBeNull();
+  });
+
+  it("returns null for ordinary text, empty, and null/undefined", () => {
+    expect(parseRelayedFrom("Hello there")).toBeNull();
+    expect(parseRelayedFrom("")).toBeNull();
+    expect(parseRelayedFrom(null)).toBeNull();
+    expect(parseRelayedFrom(undefined)).toBeNull();
+  });
+});
+
+describe("notice templates", () => {
+  const base = { ticketSubject: "Printer down", shortId: "AB12", ref: "AB12" };
+
+  it("noticeMessageEmail threads the subject and labels reply / private note / system note", () => {
+    const reply = noticeMessageEmail({ ...base, authorLabel: "Sam Agent", text: "On it.", isPrivate: false, isSystemNote: false });
+    expect(reply.subject).toBe("Re: Printer down [#AB12]");
+    expect(reply.body).toBe("Sam Agent added a reply to ticket AB12:\n\nOn it.");
+
+    const priv = noticeMessageEmail({ ...base, authorLabel: "Sam Agent", text: "internal", isPrivate: true, isSystemNote: false });
+    expect(priv.body).toContain("added a private note");
+
+    const sys = noticeMessageEmail({ ...base, authorLabel: "Relay", text: "System note: x", isPrivate: false, isSystemNote: true });
+    expect(sys.body).toContain("added a system note");
+  });
+
+  it("noticeStatusEmail threads the subject and shows old -> new", () => {
+    const { subject, body } = noticeStatusEmail({ ...base, oldStatus: "open", newStatus: "solved" });
+    expect(subject).toBe("Re: Printer down [#AB12]");
+    expect(body).toBe("Ticket AB12 status changed: open -> solved.");
+  });
+
+  it("noticeAssignmentEmail falls back to 'unassigned' for missing parts", () => {
+    const { subject, body } = noticeAssignmentEmail({ ...base, newTeam: "Escape" });
+    expect(subject).toBe("Re: Printer down [#AB12]");
+    expect(body).toBe("Ticket AB12 was reassigned — team: Escape, agent: unassigned.");
   });
 });

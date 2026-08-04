@@ -254,6 +254,11 @@ jobs:
                 "slotSetting": false,
                 "value": "${{ vars.USERMGMT_TOGGLE }}"
               },
+              {
+                "name": "NOTICES_TOGGLE",
+                "slotSetting": false,
+                "value": "${{ vars.NOTICES_TOGGLE }}"
+              },
                             {
                 "name": "TEAM_SYNC_CRON",
                 "slotSetting": false,

@@ -136,6 +136,7 @@ afterEach(() => {
   createSpy.mockRestore();
   delete process.env.HELPDESK_PAT;
   delete process.env.TICKETING_TOGGLE;
+  delete process.env.NOTICES_TOGGLE;
 });
 
 describe("TICKETING_TOGGLE (master mail-flow switch)", () => {
@@ -819,4 +820,111 @@ describe("reprocess folder (replay as new inbound; cutoff bypass; no customer ac
     expect(sendMailViaGraph).not.toHaveBeenCalled(); // ack still suppressed on reprocess
     expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
   });
+});
+
+describe("non-requester reply threading (NOTICES_TOGGLE)", () => {
+  // A follower / person-in-the-loop replying to a notice: their subject carries the [#shortID]
+  // tag, but the requester-scoped lookup can't see the ticket (they aren't its requester).
+  const TICKET = {
+    ID: "EXIST1",
+    shortID: "OLD1",
+    subject: "Need help",
+    requester: { email: "john@example.com" },
+  };
+
+  function taggedReplyFrom(address: string) {
+    (getMessage as jest.Mock).mockResolvedValue(
+      graphMsg({
+        subject: "Re: Need help [#OLD1]",
+        from: { emailAddress: { name: "Fol Lower", address } },
+      })
+    );
+  }
+
+  beforeEach(() => {
+    process.env.NOTICES_TOGGLE = "true";
+    // More-specific handler FIRST: the by-ref lookup (params carry shortID). The bare handler
+    // catches the requester-scoped list, which never sees the ticket in these tests.
+    hdMock.onGet("/tickets", { params: { shortID: "OLD1" } }).reply(200, [TICKET]);
+    hdMock.onGet("/tickets").reply(200, []);
+    hdMock.onGet("/tickets/EXIST1").reply(200, { shortID: "OLD1" });
+    hdMock.onPatch("/tickets/EXIST1").reply(200, {});
+    hdMock.onPost("/tickets").reply(200, { ID: "NEW-WRONG" });
+  });
+
+  it("threads a tagged non-requester reply into the ticket with the relayed-from marker + ack", async () => {
+    taggedReplyFrom("follower@corespecialty.com");
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(0); // no duplicate ticket
+    expect(hdMock.history.patch).toHaveLength(1);
+    const patch = JSON.parse(hdMock.history.patch[0].data);
+    expect(patch.author.type).toBe("client");
+    expect(patch.message.text.startsWith("[Relayed from follower@corespecialty.com]\n\n")).toBe(true);
+    expect(patch.message.text).toContain("Hello there");
+
+    const ack = (sendMailViaGraph as jest.Mock).mock.calls[0][0];
+    expect(ack.to).toBe("follower@corespecialty.com");
+    expect(ack.subject).toBe("Re: Need help [#OLD1]");
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+  });
+
+  it("threads WITHOUT the marker when the tagged ticket's requester IS the sender (paging miss)", async () => {
+    taggedReplyFrom("john@example.com");
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(0);
+    const patch = JSON.parse(hdMock.history.patch[0].data);
+    expect(patch.message.text).not.toContain("[Relayed from");
+  });
+
+  it("opens a new ticket (today's behavior) when the toggle is off", async () => {
+    delete process.env.NOTICES_TOGGLE;
+    taggedReplyFrom("follower@corespecialty.com");
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(1); // new ticket, no by-ref threading
+    expect(hdMock.history.get.every((g) => !(g.params as any)?.shortID)).toBe(true);
+  });
+
+  it("skips the by-ref lookup entirely when the subject has no tag", async () => {
+    (getMessage as jest.Mock).mockResolvedValue(
+      graphMsg({ from: { emailAddress: { address: "follower@corespecialty.com" } } })
+    );
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(1); // untagged -> ordinary new ticket
+    expect(hdMock.history.get.every((g) => !(g.params as any)?.shortID)).toBe(true);
+  });
+
+  it("falls through to a new ticket when the by-ref lookup is rejected with a 4xx", async () => {
+    hdMock.reset();
+    hdMock.onGet("/tickets", { params: { shortID: "OLD1" } }).reply(400, { error: "bad filter" });
+    hdMock.onGet("/tickets").reply(200, []);
+    hdMock.onPost("/tickets").reply(200, { ID: "NEW1" });
+    taggedReplyFrom("follower@corespecialty.com");
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(1);
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+  });
+
+  it("rethrows on a 5xx by-ref lookup with NO side effects (retry, never mis-thread)", async () => {
+    hdMock.reset();
+    hdMock.onGet("/tickets", { params: { shortID: "OLD1" } }).reply(500);
+    hdMock.onGet("/tickets").reply(200, []);
+    hdMock.onPost("/tickets").reply(200, { ID: "NEW-WRONG" });
+    taggedReplyFrom("follower@corespecialty.com");
+
+    await expect(processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext())).rejects.toThrow();
+
+    expect(hdMock.history.post).toHaveLength(0); // no ticket was created
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).not.toHaveBeenCalled(); // message stays for the retry
+  }, 15000); // the GET is retried by the real backoff interceptor (~4s) before failing
 });

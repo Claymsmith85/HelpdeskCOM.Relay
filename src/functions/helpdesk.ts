@@ -18,14 +18,13 @@ import { agentReplyEmail } from "./templates";
 import { createHelpdeskClient, patchCustomFields } from "./helpdesk-client";
 import { shouldSuppressRecipient } from "./routing";
 import { createStepLogger, type StepFn } from "./logging";
-import { ticketingEnabled } from "./env";
+import { noticesEnabled, ticketingEnabled } from "./env";
+// isSystemNoteText lives in ticket-notices.ts so the requester gate and the notice classifier
+// can't drift apart ("System note:" comments are never emailed to the requester).
+import { isSystemNoteText, sendTicketNotices } from "./ticket-notices";
 
 // Default shared mailbox to send agent replies from when customFields.inbox is absent.
 const DEFAULT_INBOX = "escape@corespecialty.com";
-
-// "System note:" comments are never emailed to the requester.
-const isSystemNoteText = (t?: string) =>
-  typeof t === "string" && /(^|\n)\s*System note:/i.test(t);
 
 type TicketPayload = TicketUpdatedPayload;
 type TicketEvents = TicketUpdatedPayload["payload"]["events"];
@@ -54,6 +53,32 @@ export async function helpdesk(
   });
 
   const graph = await createGraphClientFromEnv();
+
+  /**
+   * Follower / people-in-the-loop notices (NOTICES_TOGGLE, default OFF). Deliberately BEFORE the
+   * requester-specific gates below (email-sourced skip, non-agent skip, missing customFields.email
+   * return) — the notice audience hears about customer replies and status changes too, not just
+   * what the requester hears, so those gates must not starve this pass. Best-effort like the rest
+   * of the handler: sendTicketNotices never throws (and is wrapped anyway) because a 500 makes
+   * Helpdesk redeliver the webhook and every email would duplicate.
+   */
+  if (
+    noticesEnabled() &&
+    (payload.eventType === "tickets.create" || payload.eventType === "tickets.update")
+  ) {
+    try {
+      await sendTicketNotices({
+        graph,
+        helpdesk: createHelpdeskClient(),
+        payload,
+        mailbox: payload.payload.customFields?.inbox ?? DEFAULT_INBOX,
+        step,
+        stepError,
+      });
+    } catch (e) {
+      stepError("Notices: pass FAILED (ignored)", e, { ticketId: payload.payload.ID });
+    }
+  }
 
   /**
    * tickets.create (from the Helpdesk UI): patch the requester email into customFields, and email

@@ -5,6 +5,7 @@ import {
   envFlag,
   envInstantMs,
   envPositiveNumber,
+  noticesEnabled,
   requireEnv,
   ticketingEnabled,
   userMgmtEnabled,
@@ -75,35 +76,44 @@ describe("envFlag", () => {
   });
 });
 
-describe("ticketingEnabled / userMgmtEnabled (default OFF)", () => {
+describe("ticketingEnabled / userMgmtEnabled / noticesEnabled (default OFF)", () => {
   afterEach(() => {
     delete process.env.TICKETING_TOGGLE;
     delete process.env.USERMGMT_TOGGLE;
+    delete process.env.NOTICES_TOGGLE;
   });
 
   it("default OFF when the variable is unset or empty", () => {
     delete process.env.TICKETING_TOGGLE;
     delete process.env.USERMGMT_TOGGLE;
+    delete process.env.NOTICES_TOGGLE;
     expect(ticketingEnabled()).toBe(false);
     expect(userMgmtEnabled()).toBe(false);
+    expect(noticesEnabled()).toBe(false);
     process.env.TICKETING_TOGGLE = "";
     process.env.USERMGMT_TOGGLE = "";
+    process.env.NOTICES_TOGGLE = "";
     expect(ticketingEnabled()).toBe(false);
     expect(userMgmtEnabled()).toBe(false);
+    expect(noticesEnabled()).toBe(false);
   });
 
   it("ON only when explicitly enabled", () => {
     process.env.TICKETING_TOGGLE = "true";
     process.env.USERMGMT_TOGGLE = "on";
+    process.env.NOTICES_TOGGLE = "1";
     expect(ticketingEnabled()).toBe(true);
     expect(userMgmtEnabled()).toBe(true);
+    expect(noticesEnabled()).toBe(true);
   });
 
   it("OFF when explicitly disabled", () => {
     process.env.TICKETING_TOGGLE = "false";
     process.env.USERMGMT_TOGGLE = "off";
+    process.env.NOTICES_TOGGLE = "no";
     expect(ticketingEnabled()).toBe(false);
     expect(userMgmtEnabled()).toBe(false);
+    expect(noticesEnabled()).toBe(false);
   });
 });
 
