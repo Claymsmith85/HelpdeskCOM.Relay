@@ -29,6 +29,7 @@ import {
   HelpdeskAgent,
   inviteAgent,
   listAgents,
+  listTeams,
   updateAgentTeams,
   deleteAgent,
 } from "./helpdesk-client";
@@ -39,6 +40,7 @@ import { GroupRule, rulesForEnvironment } from "./team-mapping";
 import { AlertOutcome } from "./alerts";
 import { SeatLimitInfo, seatLimitFromError, sendSeatLimitAlert } from "./seat-alert";
 import { SyncFailure, sendSyncFailureAlert } from "./sync-failure-alert";
+import { AppliedChanges, hasAppliedChanges, sendSyncChangeAlert } from "./sync-change-alert";
 
 // #region Config
 
@@ -305,6 +307,9 @@ export type TeamSyncSummary = {
   seatLimited: boolean;
   seatAlert?: AlertOutcome;
   itAlert?: AlertOutcome;
+  // What the once-daily `changes` digest did about the run's successfully APPLIED changes
+  // (invites/updates/deletes) — unset when the run changed nothing.
+  changeAlert?: AlertOutcome;
 };
 
 /**
@@ -462,6 +467,9 @@ export async function runTeamSync(
   // one email rather than one per blocked user.
   const seatBlocked: { email: string; name?: string }[] = [];
   let seatLimit: SeatLimitInfo | null = null;
+  // Changes that actually LANDED, for the once-daily `changes` digest. Successes only — a failed
+  // item belongs to the seat/IT alerts above, not a "this happened" notification.
+  const applied: AppliedChanges = { invited: [], updated: [], deleted: [] };
 
   for (const inv of plan.invites) {
     try {
@@ -473,6 +481,7 @@ export async function runTeamSync(
         teamIDs: inv.teamIDs,
       });
       summary.invited++;
+      applied.invited.push({ email: inv.email, name: inv.name, roles: inv.roles, teamIDs: inv.teamIDs });
       log?.("Team sync: agent invited", {
         email: inv.email,
         agentId: id,
@@ -507,6 +516,7 @@ export async function runTeamSync(
     try {
       await updateAgentTeams(helpdesk, up.agentId, up.teamIDs);
       summary.updated++;
+      applied.updated.push({ email: up.email, added: up.added, removed: up.removed });
       log?.("Team sync: agent teams updated", {
         email: up.email,
         added: up.added,
@@ -523,6 +533,7 @@ export async function runTeamSync(
     try {
       await deleteAgent(helpdesk, del.agentId);
       summary.deleted++;
+      applied.deleted.push({ email: del.email });
       log?.("Team sync: agent deleted (no mapped teams remaining)", {
         email: del.email,
         agentId: del.agentId,
@@ -534,7 +545,7 @@ export async function runTeamSync(
     }
   }
 
-  // Best-effort by contract: neither alert may change the sync's outcome. A failure to mail is
+  // Best-effort by contract: no alert may change the sync's outcome. A failure to mail is
   // logged and swallowed — the item failures below still fail the run, as they should.
   if (seatLimit) {
     summary.seatLimited = true;
@@ -562,6 +573,33 @@ export async function runTeamSync(
       });
     } catch (e) {
       log?.("Team sync: sync-failure alert FAILED", { error: formatAxiosError(e) });
+    }
+  }
+  if (hasAppliedChanges(applied)) {
+    try {
+      // Team IDs -> names for the email body — best-effort; the alert still goes out with raw IDs.
+      let teamNames: Record<string, string> | undefined;
+      try {
+        teamNames = Object.fromEntries(
+          (await listTeams(helpdesk))
+            .filter((t) => t.ID && t.name)
+            .map((t) => [t.ID, t.name as string])
+        );
+      } catch (e) {
+        log?.("Team sync: team-name lookup for change alert FAILED (using raw IDs)", {
+          error: formatAxiosError(e),
+        });
+      }
+      summary.changeAlert = await sendSyncChangeAlert({
+        graph,
+        agents,
+        changes: applied,
+        teamNames,
+        environment: opts.environment,
+        log,
+      });
+    } catch (e) {
+      log?.("Team sync: change alert FAILED", { error: formatAxiosError(e) });
     }
   }
 

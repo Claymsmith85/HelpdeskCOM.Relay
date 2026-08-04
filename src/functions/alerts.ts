@@ -2,11 +2,12 @@
 // The generic email-alert engine: every "a human must hear about this" mail the relay sends goes
 // through sendAlert(). It owns the parts every alert needs and no alert should reimplement:
 //
-//   ROUTING.   Each alert has a CATEGORY ("it" | "licensing"; see team-mapping.ts), and each
-//              category routes to one Helpdesk team per environment (ALERT_TEAMS_BY_ENV). The
-//              recipients are that team's members on the agent list the caller already fetched —
-//              zero extra API calls, and the list is loop-guarded (shouldSuppressRecipient) so an
-//              alert can never be mailed into a drain mailbox and open a ticket.
+//   ROUTING.   Each alert has a CATEGORY ("it" | "licensing" | "changes"; see team-mapping.ts),
+//              and each category routes to one or more Helpdesk teams per environment
+//              (ALERT_TEAMS_BY_ENV). The recipients are those teams' members (unioned) on the
+//              agent list the caller already fetched — zero extra API calls, and the list is
+//              loop-guarded (shouldSuppressRecipient) so an alert can never be mailed into a
+//              drain mailbox and open a ticket.
 //
 //   THROTTLE.  At most one mail per (environment, throttle KEY, Eastern day), enforced by a
 //              create-once blob: a blob named for the key + day is PUT with `If-None-Match: *`,
@@ -36,7 +37,7 @@ import { sendMailViaGraph } from "./graph-mail";
 import { shouldSuppressRecipient } from "./routing";
 import { formatAxiosError } from "./logging";
 import { buildStorageClient } from "./storage-client";
-import { AlertCategory, alertTeamForEnvironment } from "./team-mapping";
+import { AlertCategory, alertTeamsForEnvironment } from "./team-mapping";
 import { envFlag, envPositiveNumber } from "./env";
 
 export { AlertCategory } from "./team-mapping";
@@ -159,14 +160,16 @@ async function releaseClaim(client: AxiosInstance, blob: string): Promise<void> 
 }
 
 /**
- * The routed team's members, deduped and loop-guarded. `shouldSuppressRecipient` keeps us from
- * ever mailing one of our own drain mailboxes — that would deposit the alert into an inbox the
- * relay drains, opening a ticket (see CLAUDE.md's outbound loop guard).
+ * The routed teams' members (union across teams), deduped and loop-guarded.
+ * `shouldSuppressRecipient` keeps us from ever mailing one of our own drain mailboxes — that
+ * would deposit the alert into an inbox the relay drains, opening a ticket (see CLAUDE.md's
+ * outbound loop guard).
  */
-export function alertRecipients(agents: HelpdeskAgent[], teamId: string): string[] {
+export function alertRecipients(agents: HelpdeskAgent[], teamIds: string[]): string[] {
+  const wanted = new Set(teamIds);
   const out = new Set<string>();
   for (const a of agents) {
-    if (!a.teamIDs?.includes(teamId)) continue;
+    if (!a.teamIDs?.some((t) => wanted.has(t))) continue;
     const email = (a.email ?? "").trim().toLowerCase();
     if (!email || shouldSuppressRecipient(email)) continue;
     out.add(email);
@@ -190,17 +193,17 @@ export async function sendAlert(opts: AlertOptions): Promise<AlertOutcome> {
     return "disabled";
   }
 
-  const teamId = alertTeamForEnvironment(environment, category);
-  if (!teamId) {
+  const teamIds = alertTeamsForEnvironment(environment, category);
+  if (teamIds.length === 0) {
     log?.(`${tag}: no team mapped for this environment — not sent`, {
       environment: environment ?? "unknown",
     });
     return "not-configured";
   }
 
-  const recipients = alertRecipients(agents, teamId);
+  const recipients = alertRecipients(agents, teamIds);
   if (recipients.length === 0) {
-    log?.(`${tag}: the routed team has no mailable agents — not sent`, { teamId });
+    log?.(`${tag}: the routed team(s) have no mailable agents — not sent`, { teamIds });
     return "no-recipients";
   }
 
@@ -257,6 +260,6 @@ export async function sendAlert(opts: AlertOptions): Promise<AlertOutcome> {
     return "send-failed";
   }
 
-  log?.(`${tag}: sent`, { recipients: sent, of: recipients.length, mailbox, teamId });
+  log?.(`${tag}: sent`, { recipients: sent, of: recipients.length, mailbox, teamIds });
   return "sent";
 }

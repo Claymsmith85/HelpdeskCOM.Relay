@@ -50,25 +50,39 @@ export const RULES_BY_ENV: Record<string, GroupRule[]> = {
 //     the people who hold the budget.
 //   - `it`        — operational faults in the relay's own machinery (API 4xx/5xx, group reads
 //     failing). Goes to the people who fix code and config.
+//   - `changes`   — the team sync APPLIED changes (agents invited/removed, team membership
+//     changed). Informational, not a fault: visibility for the people who own the AAD groups AND
+//     the people who watch seat usage — hence the multi-team row.
 //
-// Adding a new category: extend AlertCategory, fill in a team per environment below (undefined =
-// that environment sends no mail for the category), and alerts.ts picks it up — its per-category
-// kill switch (`ALERT_<CATEGORY>_ENABLED`) works for the new name automatically.
-export type AlertCategory = "it" | "licensing";
+// Adding a new category: extend AlertCategory, fill in a team (or team list) per environment below
+// (undefined = that environment sends no mail for the category), and alerts.ts picks it up — its
+// per-category kill switch (`ALERT_<CATEGORY>_ENABLED`) works for the new name automatically.
+export type AlertCategory = "it" | "licensing" | "changes";
 
 // `undefined` = no team mapped for that (environment, category) => NO alert mail is sent there
-// (the condition is still logged at ERROR). Licensing is Production-only: Dev shares the Helpdesk
-// account with Prod, so a Dev-mapped licensing team would mail Production's managers from the Dev
-// app. IT alerts are mapped in BOTH environments — a failing Dev sync is exactly what the
-// Development / IT Support team wants to hear about (the alert body names the environment).
-export const ALERT_TEAMS_BY_ENV: Record<string, Record<AlertCategory, string | undefined>> = {
+// (the condition is still logged at ERROR). A row may map ONE team or a LIST of teams (the
+// recipients are the union). Licensing is Production-only: Dev shares the Helpdesk account with
+// Prod, so a Dev-mapped licensing team would mail Production's managers from the Dev app. IT
+// alerts are mapped in BOTH environments — a failing Dev sync is exactly what the Development /
+// IT Support team wants to hear about (the alert body names the environment). Changes go to IT in
+// both environments, plus Management in Production (Mgmt is Production-only for the same reason
+// licensing is).
+export const ALERT_TEAMS_BY_ENV: Record<
+  string,
+  Record<AlertCategory, string | string[] | undefined>
+> = {
   Production: {
     it: "61ed7601-b6e3-43c2-936a-7afe45e4e246", // Development / IT Support (see the rule above)
     licensing: "4533d6c2-98fc-4563-855a-c5205f4c856d", // Mgmt. Team (see the rule above)
+    changes: [
+      "61ed7601-b6e3-43c2-936a-7afe45e4e246", // Development / IT Support
+      "4533d6c2-98fc-4563-855a-c5205f4c856d", // Mgmt. Team
+    ],
   },
   Development: {
     it: "5a2356e8-8303-49eb-b8ac-838ab7287d8e", // Development / IT Support (Development table)
     licensing: undefined,
+    changes: "5a2356e8-8303-49eb-b8ac-838ab7287d8e", // Development / IT Support (Development table)
   },
 };
 
@@ -86,18 +100,21 @@ export function rulesForEnvironment(envName: string | undefined): GroupRule[] {
 }
 
 /**
- * Resolve the Helpdesk team an alert category routes to. Mirrors `rulesForEnvironment`'s fallback:
- * an unset/unknown environment resolves to the Development row — so a misconfigured deploy can
- * never mail Production's managers (licensing is undefined there), while its IT alerts still reach
- * the Development / IT Support team, who are exactly the people who should hear about a
- * misconfigured deploy.
+ * Resolve the Helpdesk team(s) an alert category routes to — always a list; empty = no alert mail
+ * for this (environment, category). Mirrors `rulesForEnvironment`'s fallback: an unset/unknown
+ * environment resolves to the Development row — so a misconfigured deploy can never mail
+ * Production's managers (licensing is undefined there), while its IT alerts still reach the
+ * Development / IT Support team, who are exactly the people who should hear about a misconfigured
+ * deploy.
  */
-export function alertTeamForEnvironment(
+export function alertTeamsForEnvironment(
   envName: string | undefined,
   category: AlertCategory
-): string | undefined {
+): string[] {
   const key = (envName ?? "").trim();
   const known = Object.prototype.hasOwnProperty.call(ALERT_TEAMS_BY_ENV, key);
   const row = known ? ALERT_TEAMS_BY_ENV[key] : ALERT_TEAMS_BY_ENV[DEFAULT_ENVIRONMENT];
-  return row?.[category];
+  const raw = row?.[category];
+  if (!raw) return [];
+  return (Array.isArray(raw) ? raw : [raw]).filter(Boolean);
 }

@@ -2,7 +2,13 @@
 // A typo'd or duplicated GUID, a missing role, or a team-less agent rule would silently
 // mis-provision agents, so assert each environment table's structural invariants here — plus the
 // safe-default behavior of the environment resolver.
-import { RULES_BY_ENV, rulesForEnvironment, GroupRule } from "./team-mapping";
+import {
+  ALERT_TEAMS_BY_ENV,
+  alertTeamsForEnvironment,
+  GroupRule,
+  RULES_BY_ENV,
+  rulesForEnvironment,
+} from "./team-mapping";
 
 const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -45,5 +51,44 @@ describe("rulesForEnvironment", () => {
     expect(rulesForEnvironment(undefined)).toBe(RULES_BY_ENV.Development);
     expect(rulesForEnvironment("")).toBe(RULES_BY_ENV.Development);
     expect(rulesForEnvironment("Staging")).toBe(RULES_BY_ENV.Development);
+  });
+});
+
+describe("ALERT_TEAMS_BY_ENV", () => {
+  it("every mapped team ID (single or listed) is GUID-shaped, with no duplicates in a list", () => {
+    for (const row of Object.values(ALERT_TEAMS_BY_ENV)) {
+      for (const raw of Object.values(row)) {
+        if (!raw) continue;
+        const ids = Array.isArray(raw) ? raw : [raw];
+        expect(new Set(ids).size).toBe(ids.length);
+        for (const id of ids) expect(id).toMatch(GUID);
+      }
+    }
+  });
+});
+
+describe("alertTeamsForEnvironment", () => {
+  it("returns a single-team category as a one-element list", () => {
+    expect(alertTeamsForEnvironment("Production", "it")).toEqual([
+      ALERT_TEAMS_BY_ENV.Production.it,
+    ]);
+  });
+
+  it("returns every team of a multi-team category (changes routes to IT + Mgmt in Production)", () => {
+    expect(alertTeamsForEnvironment("Production", "changes")).toEqual(
+      ALERT_TEAMS_BY_ENV.Production.changes
+    );
+    expect(alertTeamsForEnvironment("Production", "changes")).toHaveLength(2);
+  });
+
+  it("returns [] when no team is mapped (licensing in Development => no mail)", () => {
+    expect(alertTeamsForEnvironment("Development", "licensing")).toEqual([]);
+  });
+
+  it("falls back to the Development row (never Production's) for unset/unknown environments", () => {
+    expect(alertTeamsForEnvironment(undefined, "licensing")).toEqual([]);
+    expect(alertTeamsForEnvironment("Staging", "it")).toEqual([
+      ALERT_TEAMS_BY_ENV.Development.it,
+    ]);
   });
 });
