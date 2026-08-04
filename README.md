@@ -239,10 +239,10 @@ Configured Webhooks:
 ```
 ID                                   Name                            Url                                                                                                      EventType
 --                                   ----                            ---                                                                                                      ---------
-2bd9eb52-5c21-4650-aabc-f391acecd35f corespecialty-ticket-create     https://api.corespecialty.com/hdrelay/api/helpdesk?subscription-key=cf4cd128142642558f4dd1fbd41fda12     tickets.create
-19cccd62-abb0-48fc-a996-a7c63ce4bb18 corespecialty-ticket-create2    https://api.corespecialty.com/hdrelay-dev/api/helpdesk?subscription-key=285d5e3e75fa42929a0c11c90681d1b9 tickets.create
-a4301167-ec24-46c0-98ae-ea3299a60d07 corespecialty-ticket-update     https://api.corespecialty.com/hdrelay/api/helpdesk?subscription-key=cf4cd128142642558f4dd1fbd41fda12     tickets.update
-4a7d4971-1bf8-49ba-93f7-dfd71b2cd885 corespecialty-ticket-update-dev https://api.corespecialty.com/hdrelay-dev/api/helpdesk?subscription-key=285d5e3e75fa42929a0c11c90681d1b9 tickets.update
+2bd9eb52-5c21-4650-aabc-f391acecd35f corespecialty-ticket-create     https://api.corespecialty.com/hdrelay/api/helpdesk?subscription-key=    tickets.create
+19cccd62-abb0-48fc-a996-a7c63ce4bb18 corespecialty-ticket-create2    https://api.corespecialty.com/hdrelay-dev/api/helpdesk?subscription-key= tickets.create
+a4301167-ec24-46c0-98ae-ea3299a60d07 corespecialty-ticket-update     https://api.corespecialty.com/hdrelay/api/helpdesk?subscription-key=     tickets.update
+4a7d4971-1bf8-49ba-93f7-dfd71b2cd885 corespecialty-ticket-update-dev https://api.corespecialty.com/hdrelay-dev/api/helpdesk?subscription-key= tickets.update
 ```
 
 > Security note: the `subscription-key` values above are also present in this repo's git history. Rotating the APIM subscription keys (and then scrubbing them) is a tracked, still-open follow-up.
