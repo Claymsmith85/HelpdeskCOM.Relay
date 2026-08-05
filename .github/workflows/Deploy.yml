@@ -245,19 +245,34 @@ jobs:
                 "value": "${{ vars.TEAM_SYNC_DRY_RUN }}"
               },
               {
-                "name": "TICKETING_TOGGLE",
+                "name": "MAILBOX_DRAIN",
                 "slotSetting": false,
-                "value": "${{ vars.TICKETING_TOGGLE }}"
+                "value": "${{ vars.MAILBOX_DRAIN }}"
+              },
+              {
+                "name": "TICKET_CREATE",
+                "slotSetting": false,
+                "value": "${{ vars.TICKET_CREATE }}"
+              },
+              {
+                "name": "SUBMITTER_REPLIES",
+                "slotSetting": false,
+                "value": "${{ vars.SUBMITTER_REPLIES }}"
+              },
+              {
+                "name": "AGENT_NOTICES",
+                "slotSetting": false,
+                "value": "${{ vars.AGENT_NOTICES }}"
+              },
+              {
+                "name": "FOLLOWERS_NOTICES",
+                "slotSetting": false,
+                "value": "${{ vars.FOLLOWERS_NOTICES }}"
               },
               {
                 "name": "USERMGMT_TOGGLE",
                 "slotSetting": false,
                 "value": "${{ vars.USERMGMT_TOGGLE }}"
-              },
-              {
-                "name": "NOTICES_TOGGLE",
-                "slotSetting": false,
-                "value": "${{ vars.NOTICES_TOGGLE }}"
               },
                             {
                 "name": "TEAM_SYNC_CRON",

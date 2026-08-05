@@ -26,8 +26,8 @@ src/
   index.ts                 # app.setup() + side-effect imports that register the functions
   functions/
     notify.ts              # HTTP fn:  Graph change notification -> validate -> enqueue
-    process-mail.ts        # Queue fn: dequeue -> create/update Helpdesk ticket + SharePoint + ack
-    helpdesk.ts            # HTTP fn:  Helpdesk webhook -> outbound email on agent replies (Graph sendMail)
+    process-mail.ts        # Queue fn: gated mailbox drain -> optional ticket/SharePoint/ack -> move
+    helpdesk.ts            # HTTP fn: Helpdesk webhook -> requester, assigned-agent, follower/cc mail
     renew-subscriptions.ts # Timer fn: create/renew Graph mailbox subscriptions (runOnStartup)
     sweep-inbox.ts         # Timer fn: safety-net — enqueue a drain per mailbox (runOnStartup)
     mail-poison.ts         # Queue fn: log dead-lettered drains at error severity (alertable)
@@ -61,11 +61,10 @@ Functions are registered at module load (`app.http` / `app.storageQueue` / `app.
 Sender → native shared mailbox (Inbox)
        → Graph change notification → notify (HTTP) → 202 + enqueue {mailbox, messageId}
        → Storage Queue             → process-mail (Queue)
-             → GET message + attachments (Graph)
-             → find / create Helpdesk ticket
-             → upload attachments to SharePoint
-             → sendMail acknowledgement (from the shared mailbox)
-             → move message to "HelpdeskProcessed" (idempotency)
+             → MAILBOX_DRAIN: lock + list + GET message (Graph)
+             → TICKET_CREATE: find/create ticket + attachments/SharePoint
+             → SUBMITTER_REPLIES: sendMail acknowledgement on an append
+             → MAILBOX_DRAIN: move handled message to "HelpdeskProcessed" (idempotency)
 ```
 
 1. **`notify`** receives the Graph notification at `/api/notify` (through APIM). It:
@@ -74,22 +73,21 @@ Sender → native shared mailbox (Inbox)
    - Enqueues `{ mailbox, messageId }` onto the `mail-notifications` Storage Queue and returns `202` (Graph requires an ack within ~3 s).
 
 2. **`process-mail`** (queue trigger) does the work:
-   - **Drains the whole inbox**, not just the notified message: it lists every message currently in the inbox and runs the steps below on each. Anything whose notification was dropped (e.g. mail that arrived during an app reboot) is swept up by the next notification's drain. Large backlogs are drained across several short invocations — capped at `MAIL_DRAIN_BATCH_SIZE` per run (default 10), with a self-terminating continuation drain re-enqueued when a full page is seen.
+   - When **`MAILBOX_DRAIN` is on**, **drains the whole inbox**, not just the notified message: it takes the per-mailbox lock, lists every message currently in the inbox, fetches each message, and moves handled mail to the processed folder. Anything whose notification was dropped (e.g. mail that arrived during an app reboot) is swept up by the next notification's drain. Large backlogs are drained across several short invocations — capped at `MAIL_DRAIN_BATCH_SIZE` per run (default 10), with a self-terminating continuation drain re-enqueued when a full page is seen. When the toggle is off, the handler returns before the lock or any Graph call and leaves mail untouched; notifications and sweeps keep enqueueing work for catch-up after re-enable.
    - **Ignores mail received before `MAIL_IGNORE_BEFORE`** (default the go-live boundary): the listing is filtered server-side (`receivedDateTime ge …`) so the pre-go-live backlog is never even fetched — it stays untouched in the inbox rather than being ticketed/auto-replied. (Without this, the oldest-first drain would process that backlog first.) A per-message guard backstops the always-included triggering id.
-   - **Replays the `MAIL_REPROCESS_FOLDER`** (default `Reprocess`, created on demand): every drain also scans this folder — drop a message into it (e.g. one that arrived during an outage or was filed too soon) and the next drain replays it through the full pipeline **as if it just arrived**. Reprocess intentionally **bypasses the `MAIL_IGNORE_BEFORE` cutoff** and **sends no customer auto-reply** (it only creates/updates the ticket); the message is then moved to `MAIL_PROCESSED_FOLDER` like normal mail. Pickup latency is one sweep cycle (`MAIL_SWEEP_CRON`, ≤15 min by default) since moving mail into a folder raises no inbox notification.
-   - Fetches the message (plain-text body via `Prefer: outlook.body-content-type="text"`) and its attachments via Graph.
+   - **Replays the `MAIL_REPROCESS_FOLDER`** (default `Reprocess`, created on demand): every enabled drain also scans this folder — drop a message into it (e.g. one that arrived during an outage or was filed too soon) and the next drain replays it **as if it just arrived**. Reprocess intentionally bypasses `MAIL_IGNORE_BEFORE` and suppresses the requester acknowledgement. With `TICKET_CREATE` on it creates/updates the ticket; with `TICKET_CREATE` off it is moved without ticketing, just like inbox mail. Pickup latency is one sweep cycle (`MAIL_SWEEP_CRON`, ≤15 min by default) since moving mail into a folder raises no inbox notification.
+   - Fetches the message (plain-text body via `Prefer: outlook.body-content-type="text"`). Attachments are listed/fetched only when `TICKET_CREATE` is on.
    - Ignores loop/system senders (`helpdesk.com`, the `onmicrosoft.com` tenant) and bounce senders (`postmaster@`/`mailer-daemon@`, exact local part, any domain).
    - **Never dispatches to one of our own drain mailboxes**: any outbound (ack or agent reply) addressed to a `MAILBOX_ADDRESSES` mailbox — by exact match, *or* the same mailbox under an alias company domain (`corespecialty.com` / `corespecialtyins.com`, set by `RELAY_IN_SCOPE_DOMAINS`), e.g. `escape@corespecialty.com` for a configured `escape@corespecialtyins.com` — is suppressed, otherwise it would land back in a drained inbox, open a fresh ticket, and ping-pong. This is scoped to the drain mailboxes (and their alias-domain spellings), **not** the whole company domain, so ordinary internal requesters still get replies. (Outbound counterpart to the ignored-sender guard.)
-   - Looks up the requester's existing tickets and either **updates** a matched ticket or **creates** a new one.
-   - Uploads attachments to SharePoint when the combined size is within the limit (see size policy).
-   - Sends a reply-received acknowledgement **only when an inbound updates an existing ticket** — **from the receiving shared mailbox**. A **new** ticket is opened **silently**: no "ticket has been created" notice is sent to the requester, from the relay or from Helpdesk (Helpdesk's own requester notifications are disabled in Helpdesk's admin settings, so Helpdesk sends nothing either).
-   - When attachments exceed the combined limit: uploads nothing and adds an agent `System note:` describing the overage (the original mail + attachments stay in the mailbox).
+   - With **`TICKET_CREATE` on**, looks up the requester's existing tickets and either **updates** a matched ticket or **creates** a new one, uploads eligible attachments to SharePoint, and adds oversize notes. With it off, the worker performs zero inbound Helpdesk reads/writes and moves the message without a ticket (recoverable by moving it to `MAIL_REPROCESS_FOLDER`).
+   - Sends a reply-received acknowledgement **only when an inbound updates an existing ticket and `SUBMITTER_REPLIES` is on** — **from the receiving shared mailbox**. Reprocess replays and relayed non-requester threads remain silent. A **new** ticket is always opened silently: no "ticket has been created" notice is sent to the requester, from the relay or from Helpdesk (Helpdesk's own requester notifications are disabled in Helpdesk's admin settings, so Helpdesk sends nothing either).
+   - For each attachment over the per-file limit, skips that file, uploads eligible siblings, and adds an agent `System note:` describing the overage.
    - Sends a debug email on **errors only** (when `SEND_DEBUG_EMAIL=true`).
-   - Moves the source message to `MAIL_PROCESSED_FOLDER` so a duplicate notification (whose original message id now 404s) is a no-op. Processing is at-least-once: steps **after the ticket is created/updated** (and the reply ack, when one is sent) are best-effort so a late failure can't trigger a reprocess that duplicates the ticket or re-acks.
+   - With `MAILBOX_DRAIN` on, moves every handled source message to `MAIL_PROCESSED_FOLDER` — including drain-only messages when `TICKET_CREATE` is off — so a duplicate notification (whose original message id now 404s) is a no-op. Processing is at-least-once: steps **after the ticket is created/updated** (and the reply ack, when one is sent) are best-effort so a late failure can't trigger a reprocess that duplicates the ticket or re-acks.
 
 Ticket matching prefers the `[#shortID]` threading tag in the subject, then falls back to a guarded subject-substring match (an empty ticket subject never matches). See **Subject Threading & Requester Addresses**.
 
-With **`NOTICES_TOGGLE`** on, a tagged reply from a **non-requester** (a follower / person-in-the-loop replying to a notice — invisible to the requester-scoped ticket list) is resolved by shortID (`GET /tickets?shortID=…`, client-side verified so an ignored filter can only miss, never mis-match) and **threads into the original ticket** instead of opening a duplicate, prefixed with a `[Relayed from <sender>]` attribution line (the API author is a generic "client"; a hand-typed marker on ordinary inbound mail is neutralized so attribution can't be spoofed). The tag is authoritative — it outranks the subject-substring fallback matching one of the sender's own tickets — but only for the ticket's **audience**: the sender must be its requester, a person-in-the-loop, or a follower agent, or the reply falls through to a silent new ticket. Relayed (non-requester) threads get **no reply-received ack** (an ack to a tagged mail would ping-pong with auto-responders); the requester's own replies keep theirs. A definitive 4xx on the lookup falls through to a new ticket; a 5xx or transient 408/429 rethrows before any side effect so the queue retries rather than mis-filing the reply.
+With **`MAILBOX_DRAIN` + `TICKET_CREATE` + `FOLLOWERS_NOTICES`** on, a tagged reply from a **non-requester** (a follower / person-in-the-loop replying to a notice — invisible to the requester-scoped ticket list) is resolved by shortID (`GET /tickets?shortID=…`, client-side verified so an ignored filter can only miss, never mis-match) and **threads into the original ticket** instead of opening a duplicate, prefixed with a `[Relayed from <sender>]` attribution line (the API author is a generic "client"; a hand-typed marker on ordinary inbound mail is neutralized so attribution can't be spoofed). The tag is authoritative — it outranks the subject-substring fallback matching one of the sender's own tickets — but only for the ticket's **audience**: the sender must be its requester, a person-in-the-loop, or a follower agent, or the reply falls through to a silent new ticket. Relayed (non-requester) threads get **no reply-received ack** (an ack to a tagged mail would ping-pong with auto-responders); the requester's own replies get one only when `SUBMITTER_REPLIES` is on. When ticket creation or follower notices are off, the worker skips the by-reference lookup. A definitive 4xx on the lookup falls through to a new ticket; a 5xx or transient 408/429 rethrows before any side effect so the queue retries rather than mis-filing the reply.
 
 Auth: the function key / APIM `subscription-key` is carried in the query string of `GRAPH_NOTIFICATION_URL` (Graph calls the exact URL, and appends `&validationToken=...` on validation). Treat the full notification URL (with key) as a secret.
 
@@ -103,12 +101,15 @@ Helpdesk → APIM → helpdesk function → Graph sendMail (from the shared mail
 
 Registered webhook events: `tickets.create`, `tickets.update`.
 
-The `helpdesk` function:
-- On `tickets.create` from the Helpdesk UI: patches `customFields.email` with the requester address, and emails the requester **only when the create's last event is agent-authored**. Customer-emails-in (client-authored) are already handled by `process-mail`, so they are **not echoed back**.
-- On `tickets.update`: emails the requester when the last event is **agent-authored**, not sourced from email, not a private message, and not a `System note:`.
+The `helpdesk` function is dark (immediate `200`) only when `SUBMITTER_REPLIES`, `AGENT_NOTICES`, and `FOLLOWERS_NOTICES` are all off. Otherwise:
+- On UI-authored `tickets.create` events, patches `customFields.email` with the requester address whenever the webhook is not dark. With **`SUBMITTER_REPLIES` on**, emails the requester only when the create's last event is agent-authored. Customer-emails-in (client-authored) are already handled by `process-mail`, so they are **not echoed back**.
+- On `tickets.update`, with **`SUBMITTER_REPLIES` on**, emails the requester when the last event is **agent-authored**, not sourced from email, not a private message, and not a `System note:`.
 - Sends the agent's reply **text only** (Graph `sendMail`) — attachments are not forwarded to the requester.
 - Does not update ticket status; does not create private notes.
-- **Follower / people-in-the-loop notices** (`NOTICES_TOGGLE`, default OFF): on every create/update — independently of the requester gates above, so customer replies and status changes count too, and **independently of `TICKETING_TOGGLE`** (notices-only mode: an environment with mail flow off can still test notices; enable in only one environment at a time, since dev/prod share the Helpdesk account and both receive every webhook) — the ticket's followers (`payload.followers`, agents) and people-in-the-loop (`payload.cc`, external emails) are emailed about the last event, threaded with the `[#shortID]` tag so their replies match back into the ticket. Visibility: **followers** get everything (public messages, private notes, system notes, status changes, assignment changes, follower/loop-list changes); **people-in-the-loop** get public messages, status changes, and loop-list changes only — a loop-list change doubles as the newly added person's "you've been added" welcome, since they're already on the cc list when the event fires. Echo control: the requester, the event's author, and the `[Relayed from …]` sender of a threaded reply are never notified, and every recipient passes the outbound loop guard. Best-effort: notice failures never fail the webhook (a non-200 would make Helpdesk redeliver and duplicate email).
+- **Assigned-agent notices** (`AGENT_NOTICES`, default OFF): the currently assigned agent gets a copy of every public message event, including their own Helpdesk-authored replies. Private/system notes and non-message changes do not qualify. If the assigned agent is also a follower/cc recipient, they get one agent-rules copy; if their address also equals the requester, the separate submitter and agent paths may each send a copy by design. A tagged email reply already relayed from that same agent is not copied back to them (auto-responder loop guard). Assignment alone does not authorize inbound threading: an agent replying by email threads only if they are also the requester, a follower, or a person in the loop; otherwise the reply follows the normal new-ticket path.
+- **Follower / people-in-the-loop notices** (`FOLLOWERS_NOTICES`, default OFF): on every create/update, independently of the requester gates above, the ticket's followers (`payload.followers`, agents) and people-in-the-loop (`payload.cc`, external emails) are emailed about the last event, threaded with the `[#shortID]` tag so their replies match back into the ticket. Visibility is unchanged: followers get everything (public messages, private notes, system notes, status changes, assignment changes, follower/loop-list changes); people-in-the-loop get public messages, status changes, and loop-list changes only. Echo control excludes the requester, event author, and `[Relayed from …]` sender for this audience. Every recipient in both notice audiences passes the outbound loop guard. Notice failures are best-effort and never fail the webhook (a non-200 would make Helpdesk redeliver and duplicate email).
+
+> **Webhook double-send caution:** dev and prod share one Helpdesk account, so both apps receive every webhook. `SUBMITTER_REPLIES`, `AGENT_NOTICES`, and `FOLLOWERS_NOTICES` must each be enabled in at most one environment at a time, or recipients are double-emailed.
 
 Webhook endpoint: `/api/helpdesk` (behind APIM), auth via the `subscription-key` query parameter.
 
@@ -174,12 +175,13 @@ Upload mechanics:
 Sent via Microsoft Graph `POST /users/{mailbox}/sendMail` from the relevant shared mailbox.
 
 Outbound triggers:
-- Acknowledgement on a **reply that updates an existing ticket** (via `process-mail`). A **new** ticket is opened silently — no "ticket created" notice is sent to the requester.
-- Agent replies, **text only** (via `helpdesk`).
-- Follower / people-in-the-loop notices on ticket events (via `helpdesk`, gated by `NOTICES_TOGGLE` — see the webhook flow above).
+- Acknowledgement on a **reply that updates an existing ticket** (via `process-mail`, requiring `TICKET_CREATE` + `SUBMITTER_REPLIES`). A **new** ticket is opened silently — no "ticket created" notice is sent to the requester.
+- Agent replies to the requester, **text only** (via `helpdesk`, gated by `SUBMITTER_REPLIES`).
+- Public-message copies to the assigned agent (via `helpdesk`, gated by `AGENT_NOTICES`, including the agent's own Helpdesk-authored replies; same-address relayed email is loop-suppressed).
+- Follower / people-in-the-loop notices on ticket events (via `helpdesk`, gated by `FOLLOWERS_NOTICES`).
 - Debug message (errors only, when `SEND_DEBUG_EMAIL=true`) — sent from a real shared mailbox.
 
-Acknowledgement / agent-reply `from` is the shared mailbox itself (the inbox the mail was addressed to / `customFields.inbox`, defaulting to `escape@corespecialty.com`).
+All relay email is sent from the relevant shared mailbox (the inbox the mail was addressed to / `customFields.inbox`, defaulting to `escape@corespecialty.com`).
 
 ---
 
@@ -199,7 +201,7 @@ relay's non-Entra secrets (`HELPDESK_PAT`, `GRAPH_SUBSCRIPTION_CLIENT_STATE`).
 
 **Entra (Graph application permissions on the managed identity, admin-consented):**
 - `Mail.ReadWrite` — read inbound messages and move them to the processed folder.
-- `Mail.Send` — send acks / agent replies from the shared mailboxes.
+- `Mail.Send` — send acks, requester replies, and agent/follower/cc notices from the shared mailboxes.
 - `Sites.Selected` — SharePoint upload.
 - `GroupMember.Read.All` — read AAD security-group membership for the `sync-teams` team sync (below). **Note:** the Exchange Application Access Policy scopes only the `Mail.*` roles to specific mailboxes; it does **not** constrain directory reads, so this grants tenant-wide group/user read. It is read-only — the sync's *writes* all go to Helpdesk, never back to the directory.
 
@@ -257,6 +259,9 @@ a4301167-ec24-46c0-98ae-ea3299a60d07 corespecialty-ticket-update     https://api
 
 ## Environment Variables
 
+The five mail-integration switches below are independent, default OFF, and read per invocation.
+For each, `true`/`on`/`1`/`yes` (case-insensitive) means ON; unset, empty, or any other value means OFF.
+
 | Variable | Description |
 |-----------|-------------|
 | `ATTACHMENT_MAX_BYTES` | Per-file attachment size limit in bytes (default `100 * 1024 * 1024` = 100 MiB). |
@@ -282,9 +287,12 @@ a4301167-ec24-46c0-98ae-ea3299a60d07 corespecialty-ticket-update     https://api
 | `HELPDESK_BASE_URL` | Helpdesk API base URL (defaults to `https://api.helpdesk.com/v1`). |
 | `DEBUG_EMAIL_TO` | Debug email recipients. |
 | `SEND_DEBUG_EMAIL` | Set to `true` to send the debug email on errors. Unset/empty = off. |
-| `TICKETING_TOGGLE` | **Master switch for all mail-flow interaction. Default OFF** (unset/empty = off). `true`/`on`/`1`/`yes` = on. When off, `process-mail` and the `helpdesk` webhook do nothing — no ticket create/update, no outbound email — and mail is left untouched in the mailbox (caught up on the next drain once re-enabled). Subscription renewal + inbox sweep keep running. |
+| `MAILBOX_DRAIN` | **Inbound mailbox automation. Default OFF** (unset/empty = off). `true`/`on`/`1`/`yes` = on. When on, `process-mail` takes the drain lock, lists Inbox + Reprocess, fetches messages, and moves handled mail to `MAIL_PROCESSED_FOLDER`. When off, it returns before the lock or any Graph call and mail stays untouched; notifications/sweeps keep enqueueing for later catch-up. |
+| `TICKET_CREATE` | **Inbound ticket automation. Default OFF.** When on, drained messages can find/create/append Helpdesk tickets, upload attachment links, and add oversize notes. When off, no inbound Helpdesk reads/writes occur; an enabled drain still moves mail without a ticket by design (recover via `MAIL_REPROCESS_FOLDER`). |
+| `SUBMITTER_REPLIES` | **Submitter-facing email. Default OFF.** Enables webhook delivery of agent replies to the requester and the inbound reply-received acknowledgement after an append. Acks also require `TICKET_CREATE` and remain suppressed for Reprocess/relayed threads. |
+| `AGENT_NOTICES` | **Assigned-agent public-message copies. Default OFF.** The assigned agent gets public messages, including their own Helpdesk-authored reply. No private/system notes/non-message changes, and no copy back to the same relayed-from email sender (loop guard). |
+| `FOLLOWERS_NOTICES` | **Follower / people-in-the-loop notices + non-requester reply threading. Default OFF.** Webhook notices keep the existing follower/cc visibility and echo controls. Tagged non-requester threading additionally requires `MAILBOX_DRAIN` + `TICKET_CREATE`; with ticket creation off, no by-reference lookup runs. |
 | `USERMGMT_TOGGLE` | **Master switch for `sync-teams` user/team management. Default OFF** (unset/empty = off). `true`/`on`/`1`/`yes` = on. When off, no agent invite/update/delete is attempted; the next enabled run reconciles from live state. |
-| `NOTICES_TOGGLE` | **Follower / people-in-the-loop notices + non-requester reply threading. Default OFF** (unset/empty = off; same value parsing). One flag gates both halves (they form one conversation loop). The webhook's notice pass runs **independently of `TICKETING_TOGGLE`** (notices-only mode for testing); the reply-threading half still requires ticketing. **Enable in only one environment at a time** — dev/prod share the Helpdesk account, so two enabled apps double-email every follower/cc. |
 | `SUBSCRIPTION_RENEW_CRON` | Optional override for the renewal timer (default `0 0 */6 * * *`). |
 | `MAIL_SWEEP_CRON` | Optional override for the safety-net sweep timer (default `0 */15 * * * *`, every 15 min). |
 | `RELAY_ENVIRONMENT` | Selects the team-sync mapping table in `team-mapping.ts` (`Production` \| `Development`). Injected from the deploy matrix; defaults to the Development table when unset. |
@@ -302,7 +310,9 @@ a4301167-ec24-46c0-98ae-ea3299a60d07 corespecialty-ticket-update     https://api
 
 Key Vault-linked: `GRAPH_SUBSCRIPTION_CLIENT_STATE`, `HELPDESK_PAT` (resolved by the managed identity). No Graph client secret is used anywhere — auth is the app registration federated by the user-assigned managed identity.
 
-App-setting values (non-secret) are supplied at deploy time from `Deploy.yml` (`vars.*`).
+> **Webhook double-send caution:** because dev and prod both receive the shared Helpdesk account's webhooks, each webhook-driven toggle (`SUBMITTER_REPLIES`, `AGENT_NOTICES`, `FOLLOWERS_NOTICES`) must be on in at most one environment at a time.
+
+`Deploy.yml` maps non-secret app settings from matching GitHub `vars.*` names. This repository currently has no GitHub environments/variables configured, so the live toggles are managed directly as Function App portal settings. After any deploy, re-verify all five values on the target app (or configure matching GitHub variables before deploying).
 
 ---
 
@@ -336,14 +346,14 @@ npm run test:coverage
 | `routing.test.ts` | inbox normalization, team routing, inbound loop guard |
 | `helpdesk-client.test.ts` | `findTicketByShortId`: shortID param + client-side verification, 4xx→null / 5xx→throw |
 | `templates.test.ts` | auto-reply / agent-reply / notice email builders, relayed-from marker round-trip |
-| `ticket-notices.test.ts` | notice pass: event classification, defensive follower/cc extraction, per-audience visibility, echo control, per-recipient isolation |
+| `ticket-notices.test.ts` | follower/cc + assigned-agent audiences: visibility, include-own agent replies, echo control, shared lookup, dedupe, isolation |
 | `graph-mail.test.ts` | `parseGraphMessage`, `listMessageAttachments`/`fetchAttachmentBytes`, `sendMailViaGraph` shape, oversize builder |
 | `sharepoint.test.ts` | `sanitizeSharePointName` |
 | `sharepoint.e2e.test.ts` | Graph pipeline: credential selection, site + drive resolution, folder create / `409` reuse, small content PUT + chunked session, multi-file orchestration |
 | `process-mail.helpers.test.ts` | attachment per-file policy, body formatting, queue-item parsing |
-| `process-mail.handler.test.ts` | Inbound workflow E2E: ignored sender, new + existing ticket, per-file oversize, multi-attachment upload, idempotency move |
+| `process-mail.handler.test.ts` | Inbound workflow E2E: independent drain/create/submitter gates, threading, ticket paths, attachments, idempotency move |
 | `notify.test.ts` | validationToken handshake, clientState reject, resource parse + enqueue |
-| `helpdesk.handler.test.ts` | Webhook workflow E2E: create-branch echo suppression, agent-reply email gates, notice-pass wiring |
+| `helpdesk.handler.test.ts` | Webhook workflow E2E: three-audience toggle matrix, create patch, requester gates, notice-pass wiring |
 
 Mocking: `@azure/functions` is mocked to a no-op registry (`app.http` / `app.storageQueue` / `app.timer` / `output.storageQueue`). Graph / Helpdesk HTTP is intercepted with `axios-mock-adapter`, or `./graph-mail` / `./sharepoint` are mocked at the boundary. `@azure/identity` `getToken` is mocked for the SharePoint Graph tests.
 
@@ -351,7 +361,7 @@ Mocking: `@azure/functions` is mocked to a no-op registry (`app.http` / `app.sto
 
 # CI/CD
 
-Workflow: `.github/workflows/Deploy.yml`. Build artifact → zip package → Run From Package. Non-secret app settings come from workflow `vars.*`; secrets (`HELPDESK_PAT`, `GRAPH_SUBSCRIPTION_CLIENT_STATE`) are uploaded to Key Vault and referenced. Graph auth is the managed identity (no Graph client secret deployed). Ingress: Azure API Management.
+Workflow: `.github/workflows/Deploy.yml`. Build artifact → zip package → Run From Package. The workflow maps non-secret app settings from `vars.*`, though this repo currently has no GitHub variables configured and live values are portal-managed (re-verify them after a deploy). Secrets (`HELPDESK_PAT`, `GRAPH_SUBSCRIPTION_CLIENT_STATE`) are uploaded to Key Vault and referenced. Graph auth is the managed identity (no Graph client secret deployed). Ingress: Azure API Management.
 
 > The pipeline does not yet run `npm test` as a gate.
 

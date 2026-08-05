@@ -57,6 +57,7 @@ jest.mock("./drain-lock", () => ({
 
 import axios, { AxiosInstance } from "axios";
 import MockAdapter from "axios-mock-adapter";
+import { createGraphClientFromEnv } from "./graph-client";
 import { processMail } from "./process-mail";
 import {
   getMessage,
@@ -110,9 +111,11 @@ function fakeContext() {
 
 beforeEach(() => {
   process.env.HELPDESK_PAT = "pat-token";
-  // Ticketing is OFF by default (default-OFF master switch); these workflow tests exercise the
-  // enabled behavior, so turn it on. The disabled path is covered in its own describe below.
-  process.env.TICKETING_TOGGLE = "true";
+  // Every new switch is default OFF. Most workflow tests exercise the fully-enabled inbound path;
+  // the independent disabled combinations are covered in their own cases below.
+  process.env.MAILBOX_DRAIN = "true";
+  process.env.TICKET_CREATE = "true";
+  process.env.SUBMITTER_REPLIES = "true";
   delete process.env.SEND_DEBUG_EMAIL;
 
   (getMessage as jest.Mock).mockResolvedValue(graphMsg());
@@ -135,31 +138,63 @@ afterEach(() => {
   hdMock.restore();
   createSpy.mockRestore();
   delete process.env.HELPDESK_PAT;
-  delete process.env.TICKETING_TOGGLE;
-  delete process.env.NOTICES_TOGGLE;
+  delete process.env.MAILBOX_DRAIN;
+  delete process.env.TICKET_CREATE;
+  delete process.env.SUBMITTER_REPLIES;
+  delete process.env.AGENT_NOTICES;
+  delete process.env.FOLLOWERS_NOTICES;
 });
 
-describe("TICKETING_TOGGLE (master mail-flow switch)", () => {
+describe("MAILBOX_DRAIN (mailbox action switch)", () => {
   it("does nothing when the toggle is off — no lock, no listing, no ticket/ack, no move", async () => {
-    process.env.TICKETING_TOGGLE = "false";
+    process.env.MAILBOX_DRAIN = "false";
 
     await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
 
+    expect(createGraphClientFromEnv).not.toHaveBeenCalled();
     expect(acquireDrainLock).not.toHaveBeenCalled();
     expect(listInboxMessageIds).not.toHaveBeenCalled();
+    expect(listFolderMessageIds).not.toHaveBeenCalled();
     expect(getMessage).not.toHaveBeenCalled();
+    expect(ensureMailFolder).not.toHaveBeenCalled();
     expect(hdMock.history.post).toHaveLength(0);
     expect(sendMailViaGraph).not.toHaveBeenCalled();
     expect(moveMessageToFolder).not.toHaveBeenCalled(); // mail left untouched -> caught up on re-enable
   });
 
   it("does nothing when the toggle is unset (default OFF)", async () => {
-    delete process.env.TICKETING_TOGGLE;
+    delete process.env.MAILBOX_DRAIN;
 
     await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
 
+    expect(createGraphClientFromEnv).not.toHaveBeenCalled();
     expect(acquireDrainLock).not.toHaveBeenCalled();
+    expect(listInboxMessageIds).not.toHaveBeenCalled();
+    expect(listFolderMessageIds).not.toHaveBeenCalled();
     expect(moveMessageToFolder).not.toHaveBeenCalled();
+  });
+});
+
+describe("TICKET_CREATE (ticket automation switch)", () => {
+  it("moves drained mail without any Helpdesk lookup/write, attachment work, or ack when off", async () => {
+    process.env.TICKET_CREATE = "false";
+    process.env.FOLLOWERS_NOTICES = "true";
+    (getMessage as jest.Mock).mockResolvedValue(
+      graphMsg({
+        subject: "Re: Need help [#OLD1]",
+        from: { emailAddress: { address: "follower@example.com" } },
+      })
+    );
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(hdMock.history.get).toHaveLength(0); // includes no by-ref lookup despite the tag
+    expect(hdMock.history.post).toHaveLength(0);
+    expect(hdMock.history.patch).toHaveLength(0);
+    expect(listMessageAttachments).not.toHaveBeenCalled();
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -395,6 +430,17 @@ describe("existing ticket with attachments", () => {
     expect(agentPatch.message.text).toContain("huge.bin");
 
     expect(sendMailViaGraph).toHaveBeenCalledTimes(1); // ack still sent
+  });
+
+  it("appends the reply but sends no ack when SUBMITTER_REPLIES is off", async () => {
+    process.env.SUBMITTER_REPLIES = "false";
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.patch).toHaveLength(1);
+    expect(JSON.parse(hdMock.history.patch[0].data).author.type).toBe("client");
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -822,7 +868,7 @@ describe("reprocess folder (replay as new inbound; cutoff bypass; no customer ac
   });
 });
 
-describe("non-requester reply threading (NOTICES_TOGGLE)", () => {
+describe("non-requester reply threading (FOLLOWERS_NOTICES)", () => {
   // A follower / person-in-the-loop replying to a notice: their subject carries the [#shortID]
   // tag, but the requester-scoped lookup can't see the ticket (they aren't its requester). The
   // ticket's cc/followers are the AUDIENCE the sender must belong to for the tag to thread.
@@ -845,7 +891,7 @@ describe("non-requester reply threading (NOTICES_TOGGLE)", () => {
   }
 
   beforeEach(() => {
-    process.env.NOTICES_TOGGLE = "true";
+    process.env.FOLLOWERS_NOTICES = "true";
     // More-specific handler FIRST: the by-ref lookup (params carry shortID). The bare handler
     // catches the requester-scoped list, which never sees the ticket in these tests.
     hdMock.onGet("/tickets", { params: { shortID: "OLD1" } }).reply(200, [TICKET]);
@@ -915,7 +961,7 @@ describe("non-requester reply threading (NOTICES_TOGGLE)", () => {
   });
 
   it("opens a new ticket (today's behavior) when the toggle is off", async () => {
-    delete process.env.NOTICES_TOGGLE;
+    delete process.env.FOLLOWERS_NOTICES;
     taggedReplyFrom("follower@corespecialty.com");
 
     await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());

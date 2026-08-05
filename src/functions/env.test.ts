@@ -2,12 +2,15 @@
 // imported directly.
 
 import {
+  agentNoticesEnabled,
   envFlag,
   envInstantMs,
   envPositiveNumber,
-  noticesEnabled,
+  followersNoticesEnabled,
+  mailboxDrainEnabled,
   requireEnv,
-  ticketingEnabled,
+  submitterRepliesEnabled,
+  ticketCreateEnabled,
   userMgmtEnabled,
 } from "./env";
 
@@ -76,44 +79,72 @@ describe("envFlag", () => {
   });
 });
 
-describe("ticketingEnabled / userMgmtEnabled / noticesEnabled (default OFF)", () => {
+describe("mail feature switches (default OFF)", () => {
+  const keys = [
+    "MAILBOX_DRAIN",
+    "TICKET_CREATE",
+    "SUBMITTER_REPLIES",
+    "AGENT_NOTICES",
+    "FOLLOWERS_NOTICES",
+  ] as const;
+
   afterEach(() => {
-    delete process.env.TICKETING_TOGGLE;
-    delete process.env.USERMGMT_TOGGLE;
-    delete process.env.NOTICES_TOGGLE;
+    for (const key of keys) delete process.env[key];
   });
 
   it("default OFF when the variable is unset or empty", () => {
-    delete process.env.TICKETING_TOGGLE;
-    delete process.env.USERMGMT_TOGGLE;
-    delete process.env.NOTICES_TOGGLE;
-    expect(ticketingEnabled()).toBe(false);
-    expect(userMgmtEnabled()).toBe(false);
-    expect(noticesEnabled()).toBe(false);
-    process.env.TICKETING_TOGGLE = "";
-    process.env.USERMGMT_TOGGLE = "";
-    process.env.NOTICES_TOGGLE = "";
-    expect(ticketingEnabled()).toBe(false);
-    expect(userMgmtEnabled()).toBe(false);
-    expect(noticesEnabled()).toBe(false);
+    for (const key of keys) delete process.env[key];
+    expect(mailboxDrainEnabled()).toBe(false);
+    expect(ticketCreateEnabled()).toBe(false);
+    expect(submitterRepliesEnabled()).toBe(false);
+    expect(agentNoticesEnabled()).toBe(false);
+    expect(followersNoticesEnabled()).toBe(false);
+
+    for (const key of keys) process.env[key] = "";
+    expect(mailboxDrainEnabled()).toBe(false);
+    expect(ticketCreateEnabled()).toBe(false);
+    expect(submitterRepliesEnabled()).toBe(false);
+    expect(agentNoticesEnabled()).toBe(false);
+    expect(followersNoticesEnabled()).toBe(false);
   });
 
   it("ON only when explicitly enabled", () => {
-    process.env.TICKETING_TOGGLE = "true";
-    process.env.USERMGMT_TOGGLE = "on";
-    process.env.NOTICES_TOGGLE = "1";
-    expect(ticketingEnabled()).toBe(true);
-    expect(userMgmtEnabled()).toBe(true);
-    expect(noticesEnabled()).toBe(true);
+    process.env.MAILBOX_DRAIN = "true";
+    process.env.TICKET_CREATE = "on";
+    process.env.SUBMITTER_REPLIES = "1";
+    process.env.AGENT_NOTICES = "yes";
+    process.env.FOLLOWERS_NOTICES = "TRUE";
+    expect(mailboxDrainEnabled()).toBe(true);
+    expect(ticketCreateEnabled()).toBe(true);
+    expect(submitterRepliesEnabled()).toBe(true);
+    expect(agentNoticesEnabled()).toBe(true);
+    expect(followersNoticesEnabled()).toBe(true);
   });
 
   it("OFF when explicitly disabled", () => {
-    process.env.TICKETING_TOGGLE = "false";
-    process.env.USERMGMT_TOGGLE = "off";
-    process.env.NOTICES_TOGGLE = "no";
-    expect(ticketingEnabled()).toBe(false);
+    process.env.MAILBOX_DRAIN = "false";
+    process.env.TICKET_CREATE = "off";
+    process.env.SUBMITTER_REPLIES = "0";
+    process.env.AGENT_NOTICES = "no";
+    process.env.FOLLOWERS_NOTICES = "FALSE";
+    expect(mailboxDrainEnabled()).toBe(false);
+    expect(ticketCreateEnabled()).toBe(false);
+    expect(submitterRepliesEnabled()).toBe(false);
+    expect(agentNoticesEnabled()).toBe(false);
+    expect(followersNoticesEnabled()).toBe(false);
+  });
+});
+
+describe("userMgmtEnabled (default OFF)", () => {
+  afterEach(() => delete process.env.USERMGMT_TOGGLE);
+
+  it("defaults OFF and respects explicit values", () => {
+    delete process.env.USERMGMT_TOGGLE;
     expect(userMgmtEnabled()).toBe(false);
-    expect(noticesEnabled()).toBe(false);
+    process.env.USERMGMT_TOGGLE = "true";
+    expect(userMgmtEnabled()).toBe(true);
+    process.env.USERMGMT_TOGGLE = "false";
+    expect(userMgmtEnabled()).toBe(false);
   });
 });
 

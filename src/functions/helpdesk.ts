@@ -1,8 +1,10 @@
 // src/functions/helpdesk.ts
 // Helpdesk webhook handler. On a UI-authored tickets.create it patches the requester email into
-// customFields and (only for agent replies) emails the requester; on tickets.update it emails the
-// requester for agent-authored, non-email, non-private, non-system-note events. Outbound mail
-// goes through Graph sendMail from the shared mailbox. See README "Helpdesk Webhook Flow".
+// customFields and (when enabled, only for agent replies) emails the requester; on tickets.update
+// it can email the requester for agent-authored, non-email, non-private, non-system-note events.
+// Independently enabled notice audiences are handled before those requester-specific gates.
+// Outbound mail goes through Graph sendMail from the shared mailbox. See README
+// "Helpdesk Webhook Flow".
 import {
   app,
   HttpRequest,
@@ -18,7 +20,11 @@ import { agentReplyEmail } from "./templates";
 import { createHelpdeskClient, patchCustomFields } from "./helpdesk-client";
 import { shouldSuppressRecipient } from "./routing";
 import { createStepLogger, type StepFn } from "./logging";
-import { noticesEnabled, ticketingEnabled } from "./env";
+import {
+  agentNoticesEnabled,
+  followersNoticesEnabled,
+  submitterRepliesEnabled,
+} from "./env";
 // isSystemNoteText lives in ticket-notices.ts so the requester gate and the notice classifier
 // can't drift apart ("System note:" comments are never emailed to the requester).
 import { isSystemNoteText, sendTicketNotices } from "./ticket-notices";
@@ -35,20 +41,17 @@ export async function helpdesk(
 ): Promise<HttpResponseInit> {
   const { step, stepError } = createStepLogger(context);
 
-  // Gate matrix. TICKETING_TOGGLE drives the REQUESTER flow (customFields patch + requester
-  // emails); NOTICES_TOGGLE drives the follower / people-in-the-loop notice pass INDEPENDENTLY,
-  // so notices can be tested in an environment whose mail flow is off (e.g. Dev — it shares the
-  // Helpdesk account, so its webhook sees the same events). CAUTION: for the same reason, notices
-  // must be ON in only one environment at a time — two apps with NOTICES_TOGGLE on would each
-  // send, double-emailing every follower/cc. (The inbound half of the feature — non-requester
-  // reply threading in process-mail — still requires TICKETING_TOGGLE: with mail flow off,
-  // inbound mail isn't processed at all, so replies to notices strand until ticketing is on.)
-  const ticketingOn = ticketingEnabled();
-  const noticesOn = noticesEnabled();
-  if (!ticketingOn && !noticesOn) {
-    step("Ticketing + notices disabled — skipping webhook; no email/ticket update");
+  // The three webhook-driven audiences are independent. The webhook is dark only when all three
+  // are off; otherwise tickets.create still patches customFields.email so submitter replies work
+  // for tickets created while that audience was disabled. Dev and Prod share one Helpdesk account,
+  // so each webhook toggle must be enabled in at most one environment or recipients are duplicated.
+  const submitterOn = submitterRepliesEnabled();
+  const agentOn = agentNoticesEnabled();
+  const followersOn = followersNoticesEnabled();
+  if (!submitterOn && !agentOn && !followersOn) {
+    step("Webhook audiences disabled — skipping webhook; no email/ticket update");
     // Explicit 200 (load-bearing): Helpdesk treats delivery as handled and does NOT retry the webhook.
-    return { status: 200, body: "Ticketing disabled" };
+    return { status: 200, body: "Webhook audiences disabled" };
   }
 
   const payload = (await request.json()) as unknown as TicketPayload;
@@ -62,15 +65,14 @@ export async function helpdesk(
   const graph = await createGraphClientFromEnv();
 
   /**
-   * Follower / people-in-the-loop notices (NOTICES_TOGGLE, default OFF). Deliberately BEFORE the
-   * requester-specific gates below (email-sourced skip, non-agent skip, missing customFields.email
-   * return) — the notice audience hears about customer replies and status changes too, not just
-   * what the requester hears, so those gates must not starve this pass. Best-effort like the rest
-   * of the handler: sendTicketNotices never throws (and is wrapped anyway) because a 500 makes
-   * Helpdesk redeliver the webhook and every email would duplicate.
+   * Assigned-agent and follower / people-in-the-loop notices. Deliberately BEFORE the requester-
+   * specific gates below (email-sourced skip, non-agent skip, missing customFields.email return) —
+   * notice audiences hear about events the requester does not, so those gates must not starve this
+   * pass. Best-effort like the rest of the handler: sendTicketNotices never throws (and is wrapped
+   * anyway) because a 500 makes Helpdesk redeliver the webhook and every email would duplicate.
    */
   if (
-    noticesOn &&
+    (agentOn || followersOn) &&
     (payload.eventType === "tickets.create" || payload.eventType === "tickets.update")
   ) {
     try {
@@ -81,23 +83,20 @@ export async function helpdesk(
         mailbox: payload.payload.customFields?.inbox ?? DEFAULT_INBOX,
         step,
         stepError,
+        followers: followersOn,
+        agent: agentOn,
       });
     } catch (e) {
       stepError("Notices: pass FAILED (ignored)", e, { ticketId: payload.payload.ID });
     }
   }
 
-  // Notices-only mode: with ticketing off, stop after the notice pass — no customFields patch and
-  // no requester email (the master mail-flow switch keeps its meaning for the requester flow).
-  if (!ticketingOn) {
-    step("Ticketing disabled (TICKETING_TOGGLE off) — notices processed; no ticket update/requester email");
-    return { status: 200, body: "Ticketing disabled (notices only)" };
-  }
-
   /**
    * tickets.create (from the Helpdesk UI): patch the requester email into customFields, and email
-   * the requester only when the create's last event is an agent reply. Customer-emails-in are
-   * client-authored and already handled by the inbound worker, so they are not echoed back.
+   * the requester only when SUBMITTER_REPLIES is on and the create's last event is an agent reply.
+   * Customer-emails-in are client-authored and already handled by the inbound worker, so they are
+   * not echoed back. The patch runs whenever the webhook is not dark, independent of the submitter
+   * toggle, so a ticket created during a notices-only phase is ready when submitter replies turn on.
    */
   if (
     payload.eventType === "tickets.create" &&
@@ -110,12 +109,16 @@ export async function helpdesk(
       const email = (payload.payload.requester.email ?? "").trim();
       await patchCustomFields(createHelpdeskClient(), payload.payload.ID, { email });
 
-      const text = selectEmailableAgentMessage(events);
-      if (text) {
-        await sendAgentReply(graph, payload, text, email || payload.payload.customFields.email, step);
-        step("Create: agent reply emailed");
+      if (!submitterOn) {
+        step("Create: requester email patched; submitter replies disabled");
       } else {
-        step("Create: nothing emailable (client-authored / private / system note)");
+        const text = selectEmailableAgentMessage(events);
+        if (text) {
+          await sendAgentReply(graph, payload, text, email || payload.payload.customFields.email, step);
+          step("Create: agent reply emailed");
+        } else {
+          step("Create: nothing emailable (client-authored / private / system note)");
+        }
       }
     } catch (e) {
       stepError("Create: error handling tickets.create (ignored)", e, {
@@ -129,6 +132,10 @@ export async function helpdesk(
    */
   if (payload.eventType !== "tickets.update") {
     return { body: "Not a ticket update event" };
+  }
+  if (!submitterOn) {
+    step("Update: submitter replies disabled; skipping requester email");
+    return { body: "Submitter replies disabled" };
   }
   if (events?.at(-1)?.source?.type === "email") {
     step("Update: email-sourced event already handled inbound; skipping");

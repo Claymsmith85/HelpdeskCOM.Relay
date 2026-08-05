@@ -1,20 +1,29 @@
 // src/functions/ticket-notices.ts
-// Follower / people-in-the-loop notice emails for ticket events (no Function registration — the
-// thin call lives in helpdesk.ts, the templates in templates.ts). Helpdesk's native notifications
-// are FULLY disabled (requester and agent alike; see CLAUDE.md invariant #2), so without this a
-// ticket's followers (`payload.followers`, agents) and people-in-the-loop (`payload.cc`, external
-// emails) hear nothing when a ticket changes. Gated by NOTICES_TOGGLE at the caller.
+// Ticket-event notice emails (no Function registration — the thin call lives in helpdesk.ts, the
+// templates in templates.ts). Helpdesk's native notifications are FULLY disabled (requester and
+// agent alike; see CLAUDE.md invariant #2), so without this a ticket's followers
+// (`payload.followers`, agents), people-in-the-loop (`payload.cc`, external emails), and assigned
+// agent hear nothing when a ticket changes. Audience flags are passed explicitly by the caller so
+// this module stays freely testable and never reads feature-toggle environment variables.
 //
 // Per-audience visibility (decided with the business):
 //   - FOLLOWERS (internal agents): every classified event — public messages, private notes,
 //     "System note:" texts, status changes, assignment changes.
 //   - PEOPLE IN THE LOOP (external): public messages and status changes ONLY — never private or
 //     system notes, and never assignment changes (they name internal agents/teams).
+//   - ASSIGNED AGENT: public messages ONLY, including messages authored by that same agent. These
+//     are copies of the ticket's emails, not general ticket-change notifications.
 //
-// Echo control: the requester (they have their own reply path), the event's author, and the
-// relayed-from sender (a non-requester whose reply the inbound worker threaded — see
-// templates.ts's marker pair) are excluded, and every survivor passes shouldSuppressRecipient so
-// a notice can never land in a drain mailbox and open a ticket (the outbound loop guard).
+// Echo control for followers / people in the loop: the requester (they have their own reply path),
+// the event's author, and the relayed-from sender (a non-requester whose reply the inbound worker
+// threaded — see templates.ts's marker pair) are excluded. The assigned-agent audience deliberately
+// does NOT apply the requester/author exclusions: the agent receives their own Helpdesk-authored
+// public replies, and an agent whose address equals the requester may receive both independently-
+// routed copies. It DOES suppress an assigned agent who is the relayed-from sender: otherwise an
+// out-of-office reply can thread back, be copied to the same agent, and ping-pong forever. Every
+// recipient in every audience still passes shouldSuppressRecipient so a notice can never land in
+// a drain mailbox and open a ticket. If an address is in both notice audiences, one copy is sent
+// under the assigned-agent rules.
 //
 // Field shapes (confirmed 2026-08-04 against a live ticket read): `followers` is bare agent-ID
 // strings ["<guid>"]; `cc` is [{ email, name|null }] objects. extractNoticeRecipients still parses
@@ -249,75 +258,129 @@ export async function extractNoticeRecipients(opts: {
 // #region Orchestration
 
 /**
- * Send the follower / people-in-the-loop notices for one webhook payload. NEVER throws — the
- * webhook must stay best-effort (a 500 makes Helpdesk retry the delivery, duplicating emails).
- * Per-recipient sends are individually isolated (the alerts.ts pattern).
+ * Send the enabled notice audiences for one webhook payload. NEVER throws — the webhook must
+ * stay best-effort (a 500 makes Helpdesk retry the delivery, duplicating emails). Per-recipient
+ * sends are individually isolated (the alerts.ts pattern).
  */
 export async function sendTicketNotices(opts: {
   graph: AxiosInstance;
   helpdesk: AxiosInstance;
   payload: TicketUpdatedPayload;
   mailbox: string; // shared mailbox to send AS (customFields.inbox ?? default, resolved by caller)
+  followers: boolean;
+  agent: boolean;
   step: StepFn;
   stepError: StepErrorFn;
 }): Promise<void> {
-  const { graph, helpdesk, payload, mailbox, step, stepError } = opts;
+  const {
+    graph,
+    helpdesk,
+    payload,
+    mailbox,
+    followers: followersEnabled,
+    agent: agentEnabled,
+    step,
+    stepError,
+  } = opts;
   try {
-    const p = payload.payload;
+    if (!followersEnabled && !agentEnabled) {
+      step("Notices: no audiences enabled — none sent");
+      return;
+    }
 
+    const p = payload.payload;
     const event = classifyLastEvent(p.events);
     if (!event) {
       step("Notices: last event not noticeable (empty/no-op/unrecognized) — none sent");
       return;
     }
 
-    const rawFollowers = Array.isArray(p.followers) ? p.followers : [];
-    const rawCc = Array.isArray(p.cc) ? p.cc : [];
-    if (rawFollowers.length === 0 && rawCc.length === 0) {
-      step("Notices: ticket has no followers or people in the loop — none sent");
-      return;
-    }
-
-    // Shared lazily-memoized agent list: one listAgents call at most, reused by the recipient
-    // extractor (ID-shaped follower entries) and the author-email resolution below.
+    // Shared lazily-memoized agent list: one listAgents call at most, reused by the follower
+    // extractor, follower author-email exclusion, and assigned-agent resolution.
     let agentsPromise: Promise<HelpdeskAgent[]> | null = null;
     const getAgents = () => (agentsPromise ??= listAgents(helpdesk));
 
-    const recipients = await extractNoticeRecipients({
-      followers: rawFollowers,
-      cc: rawCc,
-      getAgents,
-      log: step,
-    });
-
-    // Echo control: never notify the requester (their own reply path covers them), the event's
-    // author (by agent ID, and by email when the payload carries one — client-authored events do),
-    // or the relayed-from sender of a threaded non-requester reply.
-    const excluded = new Set(
-      [p.requester?.email, p.customFields?.email, event.authorEmail]
-        .map((e) => (e ?? "").trim().toLowerCase())
-        .filter(Boolean)
-    );
-    // An AGENT author's own address may sit in the cc list, where entries carry no agent ID — the
-    // agentId leg of the exclusion can't see them (agent events carry no author.email either). Map
-    // the authoring agent to their email — free when the extractor already fetched the list — so
-    // an agent kept "in the loop" on their own ticket isn't emailed their own replies.
-    if (event.authorId && recipients.some((r) => !r.agentId)) {
-      try {
-        const author = (await getAgents()).find((a) => a.ID === event.authorId);
-        const email = (author?.email ?? "").trim().toLowerCase();
-        if (email) excluded.add(email);
-      } catch (e) {
-        step("Notices: author email lookup failed (agent-ID exclusion still applies)", {
-          error: formatAxiosError(e),
+    const rawFollowers = Array.isArray(p.followers) ? p.followers : [];
+    const rawCc = Array.isArray(p.cc) ? p.cc : [];
+    let recipients: NoticeRecipient[] = [];
+    if (followersEnabled) {
+      if (rawFollowers.length === 0 && rawCc.length === 0) {
+        step("Notices: ticket has no followers or people in the loop — follower audience empty");
+      } else {
+        recipients = await extractNoticeRecipients({
+          followers: rawFollowers,
+          cc: rawCc,
+          getAgents,
+          log: step,
         });
       }
     }
+
+    // The assigned agent receives public messages only. Resolve them before sending follower/cc
+    // notices so a shared address can be removed from that pass: assigned-agent rules win the
+    // cross-audience dedupe, including the deliberate include-own-replies behavior.
+    const agentEventEligible =
+      agentEnabled &&
+      event.kind === "message" &&
+      !event.isPrivate &&
+      !event.isSystemNote;
+    let assignedAgentEmail: string | null = null;
+    if (agentEnabled && !agentEventEligible) {
+      step("Notices: event not a public message — assigned agent skipped", { event: event.kind });
+    } else if (agentEventEligible) {
+      const assignedAgentId = p.assignment?.agent?.ID;
+      if (!assignedAgentId) {
+        step("Notices: ticket has no assigned agent — assigned agent skipped");
+      } else {
+        try {
+          const assigned = (await getAgents()).find((a) => a.ID === assignedAgentId);
+          const email = (assigned?.email ?? "").trim().toLowerCase();
+          if (email) {
+            assignedAgentEmail = email;
+          } else {
+            step("Notices: assigned agent ID not resolvable — skipped", {
+              id: assignedAgentId,
+            });
+          }
+        } catch (e) {
+          step("Notices: assigned agent lookup FAILED — skipped", {
+            error: formatAxiosError(e),
+          });
+        }
+      }
+    }
+
+    // Follower/cc echo control: never notify the requester (their own reply path covers them), the
+    // event's author (by agent ID and by email when present), or the relayed-from sender of a
+    // threaded non-requester reply. Requester/author exclusions do not apply to the agent audience;
+    // the same-address marker-sender loop guard is applied separately at its send below.
+    const excluded = new Set<string>();
+    if (followersEnabled) {
+      for (const email of [p.requester?.email, p.customFields?.email, event.authorEmail]) {
+        const normalized = (email ?? "").trim().toLowerCase();
+        if (normalized) excluded.add(normalized);
+      }
+      // An AGENT author's own address may sit in the cc list, where entries carry no agent ID —
+      // the agentId leg of the exclusion can't see them (agent events carry no author.email
+      // either). Map the authoring agent to their email, sharing the lazy lookup above.
+      if (event.authorId && recipients.some((r) => !r.agentId)) {
+        try {
+          const author = (await getAgents()).find((a) => a.ID === event.authorId);
+          const email = (author?.email ?? "").trim().toLowerCase();
+          if (email) excluded.add(email);
+        } catch (e) {
+          step("Notices: author email lookup failed (agent-ID exclusion still applies)", {
+            error: formatAxiosError(e),
+          });
+        }
+      }
+    }
+
     const markerSender =
       event.kind === "message" && event.authorType !== "agent"
         ? parseRelayedFrom(event.text)
         : null;
-    if (markerSender) excluded.add(markerSender);
+    if (followersEnabled && markerSender) excluded.add(markerSender);
 
     // What external (cc) recipients may see: public messages, status changes, and loop-list
     // changes (which double as the "you've been added" welcome — a newly added person is already
@@ -368,33 +431,96 @@ export async function sendTicketNotices(opts: {
                 removed: event.removed,
               });
 
-    let sent = 0;
-    let suppressed = 0;
-    let failed = 0;
+    const followers = { recipients: recipients.length, sent: 0, suppressed: 0, failed: 0 };
+    const agent = {
+      recipients: assignedAgentEmail ? 1 : 0,
+      sent: 0,
+      suppressed: 0,
+      failed: 0,
+    };
+
     for (const r of recipients) {
       // Visibility ladder: cc (external) recipients only see public events; followers see all.
       if (r.source === "cc" && !publicVisibility) {
-        suppressed++;
+        followers.suppressed++;
         continue;
       }
       if (excluded.has(r.email) || (event.authorId && r.agentId === event.authorId)) {
-        suppressed++;
+        followers.suppressed++;
+        continue;
+      }
+      if (assignedAgentEmail === r.email) {
+        followers.suppressed++;
         continue;
       }
       if (!emailOk(r.email) || shouldSuppressRecipient(r.email)) {
-        suppressed++;
-        step("Notices: recipient suppressed (invalid or loop guard)", { to: r.email });
+        followers.suppressed++;
+        step("Notices: recipient suppressed (invalid or loop guard)", {
+          audience: "followers",
+          to: r.email,
+        });
         continue;
       }
       try {
-        await sendMailViaGraph({ graph, mailbox, to: r.email, subject: content.subject, body: content.body });
-        sent++;
+        await sendMailViaGraph({
+          graph,
+          mailbox,
+          to: r.email,
+          subject: content.subject,
+          body: content.body,
+        });
+        followers.sent++;
       } catch (e) {
-        failed++;
-        stepError("Notices: send FAILED (recipient skipped)", e, { to: r.email });
+        followers.failed++;
+        stepError("Notices: send FAILED (recipient skipped)", e, {
+          audience: "followers",
+          to: r.email,
+        });
       }
     }
-    step("Notices: done", { event: event.kind, recipients: recipients.length, sent, suppressed, failed });
+
+    if (assignedAgentEmail) {
+      if (markerSender === assignedAgentEmail) {
+        agent.suppressed++;
+        step("Notices: assigned agent is the relayed-from sender — skipped (auto-responder loop guard)", {
+          audience: "agent",
+          to: assignedAgentEmail,
+        });
+      } else if (!emailOk(assignedAgentEmail) || shouldSuppressRecipient(assignedAgentEmail)) {
+        agent.suppressed++;
+        step("Notices: recipient suppressed (invalid or loop guard)", {
+          audience: "agent",
+          to: assignedAgentEmail,
+        });
+      } else {
+        try {
+          await sendMailViaGraph({
+            graph,
+            mailbox,
+            to: assignedAgentEmail,
+            subject: content.subject,
+            body: content.body,
+          });
+          agent.sent++;
+        } catch (e) {
+          agent.failed++;
+          stepError("Notices: send FAILED (recipient skipped)", e, {
+            audience: "agent",
+            to: assignedAgentEmail,
+          });
+        }
+      }
+    }
+
+    step("Notices: done", {
+      event: event.kind,
+      recipients: followers.recipients + agent.recipients,
+      sent: followers.sent + agent.sent,
+      suppressed: followers.suppressed + agent.suppressed,
+      failed: followers.failed + agent.failed,
+      followers,
+      agent,
+    });
   } catch (e) {
     // Best-effort by contract: a notice failure must never fail the webhook.
     stepError("Notices: pass FAILED (ignored)", e, { ticketId: payload.payload?.ID });

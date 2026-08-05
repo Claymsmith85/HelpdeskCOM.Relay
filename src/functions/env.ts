@@ -44,44 +44,71 @@ export function envFlag(raw: string | undefined, fallback: boolean): boolean {
 }
 
 /**
- * Master switch for ALL mail-flow interaction (`TICKETING_TOGGLE`). OFF — the default when the var is
- * unset/empty — means the inbound worker (`process-mail`) and the Helpdesk webhook (`helpdesk`) do
- * nothing: no ticket create/update and no outbound email at all. The worker leaves mail UNTOUCHED in
- * the mailbox (never moved to the processed folder), so flipping the toggle back ON catches up the
- * whole OFF-window backlog on the next drain. Default-OFF is deliberate: a freshly deployed
- * environment stays dark until the variable is explicitly set to `true`.
+ * Switch for inbound mailbox automation (`MAILBOX_DRAIN`). ON lets `process-mail` take the drain
+ * lock, list Inbox/Reprocess, fetch messages, and move handled mail to the processed folder. OFF —
+ * the default when unset/empty — returns before the lock or any Graph call and leaves mail untouched
+ * for a later notification/sweep to catch up. Independent of `TICKET_CREATE`: drain ON + ticket
+ * creation OFF deliberately moves mail without a ticket.
  */
-export function ticketingEnabled(): boolean {
-  return envFlag(process.env.TICKETING_TOGGLE, false);
+export function mailboxDrainEnabled(): boolean {
+  return envFlag(process.env.MAILBOX_DRAIN, false);
+}
+
+/**
+ * Switch for inbound ticket automation (`TICKET_CREATE`). ON lets an active mailbox drain find or
+ * create/append tickets, upload attachment links, and add oversize notes. OFF — the default when
+ * unset/empty — performs no inbound Helpdesk reads/writes; an enabled drain still moves the message
+ * to processed. Reply-received acknowledgements also require `SUBMITTER_REPLIES`, and tagged
+ * non-requester threading also requires `FOLLOWERS_NOTICES`.
+ */
+export function ticketCreateEnabled(): boolean {
+  return envFlag(process.env.TICKET_CREATE, false);
+}
+
+/**
+ * Switch for submitter-facing relay email (`SUBMITTER_REPLIES`). ON enables webhook emails for agent
+ * replies and inbound reply-received acknowledgements after a ticket append. OFF — the default when
+ * unset/empty — keeps submitters silent. Acknowledgements additionally require `TICKET_CREATE` and
+ * remain suppressed for Reprocess replays and relayed non-requester threads. Dev and Prod share
+ * one Helpdesk account, so this webhook-driven flag must be ON in at most one environment.
+ */
+export function submitterRepliesEnabled(): boolean {
+  return envFlag(process.env.SUBMITTER_REPLIES, false);
+}
+
+/**
+ * Switch for assigned-agent notices (`AGENT_NOTICES`). ON lets the Helpdesk webhook send the assigned
+ * agent public-message copies, including their own Helpdesk-authored replies; a message relayed from
+ * that same email address is suppressed as an auto-responder loop guard. OFF — the default when
+ * unset/empty — sends no assigned-agent copies. The webhook is dark only when this,
+ * `SUBMITTER_REPLIES`, and `FOLLOWERS_NOTICES` are all OFF. Dev and Prod share one Helpdesk
+ * account, so this webhook-driven flag must be ON in at most one environment.
+ */
+export function agentNoticesEnabled(): boolean {
+  return envFlag(process.env.AGENT_NOTICES, false);
+}
+
+/**
+ * Switch for follower / people-in-the-loop notices and their non-requester reply threading
+ * (`FOLLOWERS_NOTICES`). ON enables the webhook notice audience and, when `MAILBOX_DRAIN` and
+ * `TICKET_CREATE` are also ON, tagged non-requester replies thread into the referenced ticket. OFF —
+ * the default when unset/empty — sends no follower/cc notices and performs no by-reference inbound
+ * lookup. The webhook is dark only when this, `SUBMITTER_REPLIES`, and `AGENT_NOTICES` are all OFF.
+ * Dev and Prod share one Helpdesk account, so this webhook-driven flag must be ON in at most one
+ * environment.
+ */
+export function followersNoticesEnabled(): boolean {
+  return envFlag(process.env.FOLLOWERS_NOTICES, false);
 }
 
 /**
  * Master switch for AAD-group → Helpdesk user/team management (`USERMGMT_TOGGLE`). OFF — the default
  * when unset/empty — means the `sync-teams` timer does nothing: no agent invite/update/delete. The
  * sync is a reconcile against live state, so a paused run loses nothing — the next enabled run
- * catches up. Default-OFF for the same staged-rollout reason as `ticketingEnabled`.
+ * catches up. Default-OFF for the same staged-rollout reason as the other feature switches.
  */
 export function userMgmtEnabled(): boolean {
   return envFlag(process.env.USERMGMT_TOGGLE, false);
-}
-
-/**
- * Switch for follower / people-in-the-loop ticket notices AND the non-requester reply threading
- * that closes their loop (`NOTICES_TOGGLE`). OFF — the default when unset/empty — means the
- * `helpdesk` webhook sends no follower/cc notices and `process-mail` does not thread a
- * `[#shortID]`-tagged reply from a non-requester (it opens a new ticket, today's behavior). One
- * flag gates BOTH halves deliberately: a notice invites a reply, and the reply must thread — the
- * halves are one conversation loop, so enabling only one is an inconsistent ops state.
- *
- * The webhook's notice pass runs INDEPENDENTLY of `ticketingEnabled` (notices-only mode, so Dev —
- * which shares the Helpdesk account and receives the same webhooks — can test notices with its
- * mail flow off). Because every environment sees the same webhooks, enable notices in ONLY ONE
- * environment at a time or every follower/cc is double-emailed. The threading half still requires
- * ticketing (with mail flow off, inbound mail isn't processed at all). Default-OFF for the same
- * staged-rollout reason as the other `*_TOGGLE`s.
- */
-export function noticesEnabled(): boolean {
-  return envFlag(process.env.NOTICES_TOGGLE, false);
 }
 
 /**

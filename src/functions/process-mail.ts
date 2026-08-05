@@ -1,9 +1,9 @@
 // src/functions/process-mail.ts
 // Storage-queue worker: the inbound orchestrator. A `notify` HTTP call enqueues
-// { mailbox, messageId }; this worker fetches the message + attachments from Graph,
-// finds-or-creates the Helpdesk ticket, uploads attachments to SharePoint, sends a reply-received
-// ack via Graph (a NEW ticket is opened silently — no "ticket created" notice), then moves the
-// message to a processed folder so duplicate notifications are no-ops.
+// { mailbox, messageId }. MAILBOX_DRAIN controls mailbox access + the processed-folder move;
+// TICKET_CREATE independently controls Helpdesk/attachment work; SUBMITTER_REPLIES controls the
+// existing-ticket ack; FOLLOWERS_NOTICES controls tagged non-requester threading. A NEW ticket is
+// always opened silently. The processed-folder move makes duplicate notifications no-ops.
 //
 // API/identity/routing/logging concerns live in their own modules (helpdesk-client,
 // routing, logging); this file is the workflow + the attachment policy.
@@ -12,7 +12,14 @@ import { AxiosError, AxiosInstance } from "axios";
 
 import { createGraphClientFromEnv, graphConfigFromEnv } from "./graph-client";
 import { acquireDrainLock } from "./drain-lock";
-import { envInstantMs, envPositiveNumber, noticesEnabled, ticketingEnabled } from "./env";
+import {
+  envInstantMs,
+  envPositiveNumber,
+  followersNoticesEnabled,
+  mailboxDrainEnabled,
+  submitterRepliesEnabled,
+  ticketCreateEnabled,
+} from "./env";
 import { MAIL_QUEUE_NAME, mailQueueOutput, type MailQueueItem } from "./mail-queue";
 import {
   getMessage,
@@ -167,13 +174,13 @@ export async function processMail(
   const { mailbox, messageId } = item;
   step("Start: drain inbox", { mailbox, messageId: messageId ?? null });
 
-  // Master mail-flow switch (TICKETING_TOGGLE). When OFF (the default), do NOT touch the mailbox:
-  // no lock, no listing, no ticket create/update, no ack — and crucially no move to the processed
-  // folder. Mail is left in the inbox so flipping the toggle back ON catches up the whole backlog on
-  // the next drain (sweep-inbox and live notifications keep enqueuing drains while off). We return
-  // WITHOUT throwing so this queue item is acked cleanly (no poison-queue churn).
-  if (!ticketingEnabled()) {
-    step("Ticketing disabled (TICKETING_TOGGLE off) — leaving mailbox untouched; no ticket/email this drain");
+  // Mailbox action switch (MAILBOX_DRAIN). When OFF (the default), do NOT touch the mailbox: no
+  // lock, no listing, and crucially no move to the processed folder. Mail is left in the inbox so
+  // flipping the toggle back ON catches up the whole backlog on the next drain (sweep-inbox and
+  // live notifications keep enqueuing drains while off). We return WITHOUT throwing so this queue
+  // item is acked cleanly (no poison-queue churn).
+  if (!mailboxDrainEnabled()) {
+    step("Mailbox drain disabled (MAILBOX_DRAIN off) — leaving mailbox untouched");
     return;
   }
 
@@ -396,6 +403,16 @@ async function processSingleMessage(
     return;
   }
 
+  // MAILBOX_DRAIN and TICKET_CREATE are deliberately independent. In drain-only mode, handled
+  // mail is consumed and moved to the processed folder without making any Helpdesk request (and
+  // without fetching attachments or attempting a requester acknowledgement). This is intentionally
+  // destructive from the inbox's point of view; an operator can move a message to Reprocess later.
+  if (!ticketCreateEnabled()) {
+    step("Ticket automation off — message moved without ticketing", { messageId });
+    await safeMoveToProcessed(graph, mailbox, messageId, step, stepError);
+    return;
+  }
+
   const helpdesk = createHelpdeskClient();
 
   step("Graph: listMessageAttachments begin");
@@ -427,7 +444,7 @@ async function processSingleMessage(
     ticketId: existingTicket?.ID ?? null,
   });
 
-  // Non-requester reply threading (NOTICES_TOGGLE): a follower / person-in-the-loop replying to a
+  // Non-requester reply threading (FOLLOWERS_NOTICES): a follower / person-in-the-loop replying to a
   // notice carries the [#shortID] tag, but the sender-scoped lookup above can't see the ticket
   // (they aren't its requester) — without this, their reply opens a duplicate ticket. The tag is
   // AUTHORITATIVE: it also outranks findExistingTicket's subject-substring fallback picking one of
@@ -438,7 +455,7 @@ async function processSingleMessage(
   // falls through to today's behavior. All lookups run BEFORE any side effect: a transient failure
   // (5xx/429/listAgents) rethrows -> queue retry, never a mis-filed reply.
   let relayedFrom: string | undefined;
-  if (noticesEnabled()) {
+  if (followersNoticesEnabled()) {
     const ref = extractTicketRef(parsed.subject);
     const refMatchedSenderTicket =
       !!ref && !!existingTicket && normalizeRef(existingTicket.shortID) === normalizeRef(ref);
@@ -484,12 +501,24 @@ async function processSingleMessage(
   step("Route: inbox + team", { normalizedInbox, teamId });
 
   if (existingTicket) {
+    const suppressAckReason = reprocess
+      ? "reprocess replay"
+      : relayedFrom !== undefined
+        ? "relayed non-requester reply"
+        : !submitterRepliesEnabled()
+          ? "SUBMITTER_REPLIES off"
+          : undefined;
     await handleExistingTicket({
       graph, helpdesk, mailbox, parsed, existingTicket, uploadItems,
       // No ack for a RELAYED (non-requester) thread: acking would mail the follower/loop sender a
       // tagged message, and an auto-responder on their side would reply, re-thread, and re-ack
       // forever — the ack is the fuel of that loop. Their reply still lands in the ticket.
-      blocked: plan.blocked, suppressAck: reprocess || relayedFrom !== undefined, relayedFrom, step, stepError,
+      // SUBMITTER_REPLIES independently gates the normal requester-facing acknowledgement.
+      blocked: plan.blocked,
+      suppressAckReason,
+      relayedFrom,
+      step,
+      stepError,
     });
   } else {
     await handleNewTicket({
@@ -539,13 +568,26 @@ async function handleExistingTicket(opts: {
   existingTicket: TicketSummary;
   uploadItems: SharePointUploadItem[];
   blocked: AttachmentMeta[];
-  suppressAck: boolean;
+  /** Why the requester acknowledgement is suppressed; absent means it may be sent. */
+  suppressAckReason?: string;
   /** Set when a NON-requester's tagged reply was threaded in — prefixes the relayed-from marker. */
   relayedFrom?: string;
   step: StepFn;
   stepError: StepErrorFn;
 }): Promise<void> {
-  const { graph, mailbox, helpdesk, parsed, existingTicket, uploadItems, blocked, suppressAck, relayedFrom, step, stepError } = opts;
+  const {
+    graph,
+    mailbox,
+    helpdesk,
+    parsed,
+    existingTicket,
+    uploadItems,
+    blocked,
+    suppressAckReason,
+    relayedFrom,
+    step,
+    stepError,
+  } = opts;
 
   const { folderWebUrl, uploadedLinks } = await uploadToTicket({
     helpdesk, ticketId: existingTicket.ID, fromAddress: parsed.fromAddress, uploadItems, step, stepError,
@@ -561,10 +603,11 @@ async function handleExistingTicket(opts: {
   const messageText = buildTicketMessageText(baseText, uploadedLinks, folderWebUrl);
   await updateTicketMessage({ helpdesk, ticketId: existingTicket.ID, text: messageText, authorType: "client" });
 
-  // Suppressed for a reprocess replay (the original ack already went out) and for a relayed
-  // non-requester thread (acking a tagged mail back at the sender fuels an auto-responder loop).
-  if (suppressAck) {
-    step("Ack suppressed (reprocess replay or relayed non-requester reply)", { ticketId: existingTicket.ID });
+  // Suppressed for a reprocess replay (the original ack already went out), a relayed non-requester
+  // thread (acking a tagged mail back at the sender fuels an auto-responder loop), or when the
+  // independent submitter-facing email switch is off.
+  if (suppressAckReason) {
+    step("Ack suppressed", { ticketId: existingTicket.ID, reason: suppressAckReason });
   } else {
     const ack = existingTicketAutoReply({
       inboundSubject: parsed.subject,

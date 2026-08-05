@@ -138,7 +138,7 @@ export function neutralizeForgedMarker(text: string): string {
 /**
  * Notice for a message event on a ticket (agent reply, customer reply, private note, system note).
  * The subject is threaded so a recipient's reply matches back into the SAME ticket (the inbound
- * worker threads tagged non-requester replies when NOTICES_TOGGLE is on).
+ * worker threads tagged non-requester replies when FOLLOWERS_NOTICES is on).
  */
 export function noticeMessageEmail(opts: {
   ticketSubject: string;

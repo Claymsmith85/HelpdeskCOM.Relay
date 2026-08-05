@@ -30,10 +30,12 @@ jest.mock("./ticket-notices", () => ({
 }));
 
 import { helpdesk } from "./helpdesk";
+import { createGraphClientFromEnv } from "./graph-client";
 import { sendMailViaGraph } from "./graph-mail";
 import { patchCustomFields } from "./helpdesk-client";
 import { sendTicketNotices } from "./ticket-notices";
 
+const graphMock = createGraphClientFromEnv as jest.Mock;
 const sendMock = sendMailViaGraph as jest.Mock;
 const patchMock = patchCustomFields as jest.Mock;
 const noticesMock = sendTicketNotices as jest.Mock;
@@ -43,21 +45,25 @@ function fakeContext() {
 }
 
 function fakeRequest(payload: any) {
-  return { json: async () => payload, body: {} } as any;
+  return { json: jest.fn().mockResolvedValue(payload), body: {} } as any;
 }
 
 beforeEach(() => {
-  // Ticketing is OFF by default; these tests exercise enabled behavior. Disabled path has its own test.
-  process.env.TICKETING_TOGGLE = "true";
+  // Submitter replies are OFF by default; most workflow tests exercise the enabled requester path.
+  // The independent toggle matrix below overrides this default where needed.
+  delete process.env.AGENT_NOTICES;
+  delete process.env.FOLLOWERS_NOTICES;
+  process.env.SUBMITTER_REPLIES = "true";
 });
 
 afterEach(() => {
   delete process.env.MAILBOX_ADDRESSES;
-  delete process.env.TICKETING_TOGGLE;
-  delete process.env.NOTICES_TOGGLE;
+  delete process.env.SUBMITTER_REPLIES;
+  delete process.env.AGENT_NOTICES;
+  delete process.env.FOLLOWERS_NOTICES;
 });
 
-describe("TICKETING_TOGGLE (master mail-flow switch)", () => {
+describe("independent webhook audience toggles", () => {
   const agentCreate = {
     eventType: "tickets.create",
     payload: {
@@ -73,37 +79,66 @@ describe("TICKETING_TOGGLE (master mail-flow switch)", () => {
     },
   };
 
-  it("does nothing (no patch, no email, no notices) when both toggles are off, and returns a body", async () => {
-    process.env.TICKETING_TOGGLE = "false";
+  it("returns an explicit 200 without reading the payload or calling dependencies when all three are off", async () => {
+    process.env.SUBMITTER_REPLIES = "false";
 
-    const res = await helpdesk(fakeRequest(agentCreate), fakeContext());
+    const request = fakeRequest(agentCreate);
+    const res = await helpdesk(request, fakeContext());
 
+    expect(request.json).not.toHaveBeenCalled();
+    expect(graphMock).not.toHaveBeenCalled();
     expect(patchMock).not.toHaveBeenCalled();
     expect(sendMock).not.toHaveBeenCalled();
     expect(noticesMock).not.toHaveBeenCalled();
-    expect(res.body).toBe("Ticketing disabled");
+    expect(res.body).toBe("Webhook audiences disabled");
     // 200 is load-bearing: a non-200 would make Helpdesk retry the webhook.
     expect(res.status).toBe(200);
   });
 
-  it("NOTICES-ONLY mode: ticketing off + notices on runs the notice pass but no patch/requester email", async () => {
-    process.env.TICKETING_TOGGLE = "false";
-    process.env.NOTICES_TOGGLE = "true";
+  it("SUBMITTER_REPLIES only patches and emails the requester without running notices", async () => {
+    await helpdesk(fakeRequest(agentCreate), fakeContext());
 
-    const res = await helpdesk(fakeRequest(agentCreate), fakeContext());
-
-    expect(noticesMock).toHaveBeenCalledTimes(1); // notices independent of the mail-flow switch
-    expect(patchMock).not.toHaveBeenCalled(); // requester flow stays dark
-    expect(sendMock).not.toHaveBeenCalled();
-    expect(res.status).toBe(200); // still acked so Helpdesk does not retry
+    expect(patchMock).toHaveBeenCalledWith(
+      expect.anything(),
+      "T1",
+      { email: "john@example.com" }
+    );
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][0].to).toBe("john@example.com");
+    expect(noticesMock).not.toHaveBeenCalled();
   });
 
-  it("does nothing when the toggle is unset (default OFF)", async () => {
-    delete process.env.TICKETING_TOGGLE;
+  it("FOLLOWERS_NOTICES only runs that notice audience, patches creates, and sends no requester email", async () => {
+    process.env.SUBMITTER_REPLIES = "false";
+    process.env.FOLLOWERS_NOTICES = "true";
 
     await helpdesk(fakeRequest(agentCreate), fakeContext());
 
-    expect(patchMock).not.toHaveBeenCalled();
+    expect(noticesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ followers: true, agent: false })
+    );
+    expect(patchMock).toHaveBeenCalledWith(
+      expect.anything(),
+      "T1",
+      { email: "john@example.com" }
+    );
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("AGENT_NOTICES only runs that notice audience, patches creates, and sends no requester email", async () => {
+    process.env.SUBMITTER_REPLIES = "false";
+    process.env.AGENT_NOTICES = "true";
+
+    await helpdesk(fakeRequest(agentCreate), fakeContext());
+
+    expect(noticesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ followers: false, agent: true })
+    );
+    expect(patchMock).toHaveBeenCalledWith(
+      expect.anything(),
+      "T1",
+      { email: "john@example.com" }
+    );
     expect(sendMock).not.toHaveBeenCalled();
   });
 });
@@ -291,7 +326,7 @@ describe("tickets.update", () => {
   });
 });
 
-describe("follower / people-in-the-loop notice pass (NOTICES_TOGGLE)", () => {
+describe("follower / people-in-the-loop notice pass (FOLLOWERS_NOTICES)", () => {
   // A client-authored, EMAIL-sourced update with no customFields.email: every requester gate
   // skips it, which is exactly why the notice pass must run before those gates.
   function clientUpdate() {
@@ -313,13 +348,13 @@ describe("follower / people-in-the-loop notice pass (NOTICES_TOGGLE)", () => {
     };
   }
 
-  it("is not invoked when NOTICES_TOGGLE is unset (default OFF)", async () => {
+  it("is not invoked when FOLLOWERS_NOTICES is unset (default OFF)", async () => {
     await helpdesk(fakeRequest(clientUpdate()), fakeContext());
     expect(noticesMock).not.toHaveBeenCalled();
   });
 
   it("runs on updates the requester gates would skip (client-authored, email-sourced, no customFields.email)", async () => {
-    process.env.NOTICES_TOGGLE = "true";
+    process.env.FOLLOWERS_NOTICES = "true";
 
     await helpdesk(fakeRequest(clientUpdate()), fakeContext());
 
@@ -327,11 +362,13 @@ describe("follower / people-in-the-loop notice pass (NOTICES_TOGGLE)", () => {
     const arg = noticesMock.mock.calls[0][0];
     expect(arg.payload.payload.ID).toBe("T3");
     expect(arg.mailbox).toBe("escapereferrals@corespecialty.com");
+    expect(arg.followers).toBe(true);
+    expect(arg.agent).toBe(false);
     expect(sendMock).not.toHaveBeenCalled(); // requester flow still correctly skipped
   });
 
   it("runs on tickets.create too, and the customFields patch still happens", async () => {
-    process.env.NOTICES_TOGGLE = "true";
+    process.env.FOLLOWERS_NOTICES = "true";
     const payload = clientUpdate() as any;
     payload.eventType = "tickets.create";
     payload.payload.source = { type: "email", detailedSource: "helpdesk" };
@@ -343,7 +380,7 @@ describe("follower / people-in-the-loop notice pass (NOTICES_TOGGLE)", () => {
   });
 
   it("coexists with the requester email on an agent-authored update", async () => {
-    process.env.NOTICES_TOGGLE = "true";
+    process.env.FOLLOWERS_NOTICES = "true";
     const payload = clientUpdate() as any;
     payload.payload.customFields.email = "jane@example.com";
     payload.payload.events = [
@@ -358,7 +395,7 @@ describe("follower / people-in-the-loop notice pass (NOTICES_TOGGLE)", () => {
   });
 
   it("falls back to the default inbox when customFields has no inbox", async () => {
-    process.env.NOTICES_TOGGLE = "true";
+    process.env.FOLLOWERS_NOTICES = "true";
     const payload = clientUpdate() as any;
     delete payload.payload.customFields.inbox;
 
@@ -368,7 +405,7 @@ describe("follower / people-in-the-loop notice pass (NOTICES_TOGGLE)", () => {
   });
 
   it("a notice-pass failure never fails the webhook or the requester email", async () => {
-    process.env.NOTICES_TOGGLE = "true";
+    process.env.FOLLOWERS_NOTICES = "true";
     noticesMock.mockRejectedValueOnce(new Error("notices down"));
     const payload = clientUpdate() as any;
     payload.payload.customFields.email = "jane@example.com";

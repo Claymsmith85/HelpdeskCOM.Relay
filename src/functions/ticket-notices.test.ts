@@ -1,7 +1,7 @@
-// Tests for the follower / people-in-the-loop notice module (ticket-notices.ts): event
-// classification, the defensive recipient extractor, per-audience visibility, echo control, and
-// the never-throw send orchestration. Graph and Helpdesk boundaries are mocked at the module
-// boundary (the helpdesk.handler.test.ts convention).
+// Tests for the ticket notice module (ticket-notices.ts): event classification, the defensive
+// recipient extractor, follower/cc and assigned-agent visibility, echo control, cross-audience
+// dedupe, and the never-throw send orchestration. Graph and Helpdesk boundaries are mocked at the
+// module boundary (the helpdesk.handler.test.ts convention).
 
 jest.mock("./graph-mail", () => ({ sendMailViaGraph: jest.fn().mockResolvedValue(undefined) }));
 jest.mock("./helpdesk-client", () => ({ listAgents: jest.fn() }));
@@ -232,6 +232,7 @@ describe("extractNoticeRecipients", () => {
 
 const FOLLOWER = "follower@corespecialty.com";
 const LOOP = "loop@example.com";
+const ASSIGNED = "assigned.agent@corespecialty.com";
 
 function payload(over: Record<string, any> = {}): any {
   return {
@@ -256,12 +257,16 @@ function payload(over: Record<string, any> = {}): any {
   };
 }
 
-function callNotices(p: any) {
+function callNotices(
+  p: any,
+  audiences: { followers: boolean; agent: boolean } = { followers: true, agent: false }
+) {
   return sendTicketNotices({
     graph: {} as any,
     helpdesk: {} as any,
     payload: p,
     mailbox: "escape@corespecialty.com",
+    ...audiences,
     step,
     stepError,
   });
@@ -270,6 +275,213 @@ function callNotices(p: any) {
 describe("sendTicketNotices", () => {
   beforeEach(() => {
     agentsMock.mockResolvedValue([{ ID: "ag1", email: FOLLOWER }]);
+  });
+
+  describe("assigned-agent audience", () => {
+    it("emails the assigned agent a public reply even when that agent authored it", async () => {
+      agentsMock.mockResolvedValue([{ ID: "ag9", email: ASSIGNED }]);
+
+      await callNotices(
+        payload({
+          assignment: { agent: { ID: "ag9", name: "Sam Agent" } },
+          events: [
+            {
+              author: { type: "agent", ID: "ag9", name: "Sam Agent" },
+              message: { text: "My own reply", isPrivate: false },
+            },
+          ],
+        }),
+        { followers: false, agent: true }
+      );
+
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      expect(sendMock.mock.calls[0][0]).toMatchObject({
+        mailbox: "escape@corespecialty.com",
+        to: ASSIGNED,
+        subject: "Re: Printer down [#AB12]",
+        body: "Sam Agent added a reply to ticket AB12:\n\nMy own reply",
+      });
+    });
+
+    it("emails the assigned agent a public submitter reply", async () => {
+      agentsMock.mockResolvedValue([{ ID: "ag9", email: ASSIGNED }]);
+
+      await callNotices(
+        payload({
+          assignment: { agent: { ID: "ag9", name: "Sam Agent" } },
+          events: [
+            {
+              author: { type: "client", email: "jane@example.com", name: "Jane" },
+              message: { text: "Customer follow-up", isPrivate: false },
+            },
+          ],
+        }),
+        { followers: false, agent: true }
+      );
+
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      expect(sendMock.mock.calls[0][0]).toMatchObject({
+        to: ASSIGNED,
+        body: "Jane added a reply to ticket AB12:\n\nCustomer follow-up",
+      });
+    });
+
+    it("does not copy a relayed email reply back to that same assigned agent", async () => {
+      agentsMock.mockResolvedValue([{ ID: "ag9", email: ASSIGNED }]);
+
+      await callNotices(
+        payload({
+          assignment: { agent: { ID: "ag9", name: "Sam Agent" } },
+          followers: [],
+          cc: [ASSIGNED],
+          events: [
+            {
+              author: { type: "client", ID: "c1" },
+              message: {
+                text: `[Relayed from ${ASSIGNED}]\n\nOut of office`,
+                isPrivate: false,
+              },
+            },
+          ],
+        }),
+        { followers: true, agent: true }
+      );
+
+      expect(sendMock).not.toHaveBeenCalled();
+      expect(step).toHaveBeenCalledWith(
+        expect.stringContaining("auto-responder loop guard"),
+        { audience: "agent", to: ASSIGNED }
+      );
+    });
+
+    it("does not email the assigned agent for private/system notes or ticket changes", async () => {
+      const assigned = { agent: { ID: "ag9", name: "Sam Agent" } };
+
+      await callNotices(
+        payload({
+          assignment: assigned,
+          events: [
+            {
+              author: { type: "agent", ID: "ag9" },
+              message: { text: "Private", isPrivate: true },
+            },
+          ],
+        }),
+        { followers: false, agent: true }
+      );
+      await callNotices(
+        payload({
+          assignment: assigned,
+          events: [
+            {
+              author: { type: "agent", ID: "ag9" },
+              message: { text: "System note: internal", isPrivate: false },
+            },
+          ],
+        }),
+        { followers: false, agent: true }
+      );
+      await callNotices(
+        payload({
+          assignment: assigned,
+          events: [{ status: { old: "open", new: "solved" } }],
+        }),
+        { followers: false, agent: true }
+      );
+      await callNotices(
+        payload({
+          assignment: assigned,
+          events: [
+            {
+              assignment: {
+                new: { agent: { ID: "ag9", name: "Sam Agent" } },
+                old: {},
+              },
+            },
+          ],
+        }),
+        { followers: false, agent: true }
+      );
+
+      expect(sendMock).not.toHaveBeenCalled();
+      expect(agentsMock).not.toHaveBeenCalled();
+    });
+
+    it("step-logs and skips an unresolvable assigned-agent ID", async () => {
+      await callNotices(
+        payload({ assignment: { agent: { ID: "missing", name: "Missing Agent" } } }),
+        { followers: false, agent: true }
+      );
+
+      expect(agentsMock).toHaveBeenCalledTimes(1);
+      expect(sendMock).not.toHaveBeenCalled();
+      expect(
+        step.mock.calls.some(([message]) =>
+          String(message).includes("assigned agent ID not resolvable")
+        )
+      ).toBe(true);
+    });
+
+    it("sends one agent-rules copy when the assigned agent is also a follower", async () => {
+      agentsMock.mockResolvedValue([{ ID: "ag1", email: FOLLOWER }]);
+
+      await callNotices(
+        payload({
+          assignment: { agent: { ID: "ag1", name: "Follower Agent" } },
+          cc: [],
+        }),
+        { followers: true, agent: true }
+      );
+
+      expect(agentsMock).toHaveBeenCalledTimes(1);
+      expect(sendMock).toHaveBeenCalledTimes(1);
+      expect(sendMock.mock.calls[0][0].to).toBe(FOLLOWER);
+      expect(step).toHaveBeenCalledWith(
+        "Notices: done",
+        expect.objectContaining({
+          recipients: 2,
+          sent: 1,
+          suppressed: 1,
+          failed: 0,
+          followers: { recipients: 1, sent: 0, suppressed: 1, failed: 0 },
+          agent: { recipients: 1, sent: 1, suppressed: 0, failed: 0 },
+        })
+      );
+    });
+
+    it("sends only the agent copy when the follower/cc audience is disabled", async () => {
+      agentsMock.mockResolvedValue([
+        { ID: "ag1", email: FOLLOWER },
+        { ID: "ag2", email: ASSIGNED },
+      ]);
+
+      await callNotices(
+        payload({ assignment: { agent: { ID: "ag2", name: "Assigned Agent" } } }),
+        { followers: false, agent: true }
+      );
+
+      expect(sendMock.mock.calls.map((c) => c[0].to)).toEqual([ASSIGNED]);
+      expect(agentsMock).toHaveBeenCalledTimes(1);
+      expect(
+        step.mock.calls.some(([message]) => String(message).includes("raw follower/cc arrays"))
+      ).toBe(false);
+    });
+
+    it("applies the outbound mailbox loop guard to the assigned agent", async () => {
+      process.env.MAILBOX_ADDRESSES = ASSIGNED;
+      agentsMock.mockResolvedValue([{ ID: "ag2", email: ASSIGNED }]);
+
+      await callNotices(
+        payload({ assignment: { agent: { ID: "ag2", name: "Assigned Agent" } } }),
+        { followers: false, agent: true }
+      );
+
+      expect(sendMock).not.toHaveBeenCalled();
+      expect(step).toHaveBeenCalledWith(
+        "Notices: recipient suppressed (invalid or loop guard)",
+        { audience: "agent", to: ASSIGNED }
+      );
+    });
   });
 
   it("emails followers and loop people a public agent reply, threaded from the ticket mailbox", async () => {
