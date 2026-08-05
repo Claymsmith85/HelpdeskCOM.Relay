@@ -824,12 +824,15 @@ describe("reprocess folder (replay as new inbound; cutoff bypass; no customer ac
 
 describe("non-requester reply threading (NOTICES_TOGGLE)", () => {
   // A follower / person-in-the-loop replying to a notice: their subject carries the [#shortID]
-  // tag, but the requester-scoped lookup can't see the ticket (they aren't its requester).
+  // tag, but the requester-scoped lookup can't see the ticket (they aren't its requester). The
+  // ticket's cc/followers are the AUDIENCE the sender must belong to for the tag to thread.
   const TICKET = {
     ID: "EXIST1",
     shortID: "OLD1",
     subject: "Need help",
     requester: { email: "john@example.com" },
+    cc: [{ email: "follower@corespecialty.com", name: null }],
+    followers: [],
   };
 
   function taggedReplyFrom(address: string) {
@@ -852,7 +855,7 @@ describe("non-requester reply threading (NOTICES_TOGGLE)", () => {
     hdMock.onPost("/tickets").reply(200, { ID: "NEW-WRONG" });
   });
 
-  it("threads a tagged non-requester reply into the ticket with the relayed-from marker + ack", async () => {
+  it("threads a tagged audience (cc) reply with the relayed-from marker and NO ack (loop safety)", async () => {
     taggedReplyFrom("follower@corespecialty.com");
 
     await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
@@ -864,13 +867,42 @@ describe("non-requester reply threading (NOTICES_TOGGLE)", () => {
     expect(patch.message.text.startsWith("[Relayed from follower@corespecialty.com]\n\n")).toBe(true);
     expect(patch.message.text).toContain("Hello there");
 
-    const ack = (sendMailViaGraph as jest.Mock).mock.calls[0][0];
-    expect(ack.to).toBe("follower@corespecialty.com");
-    expect(ack.subject).toBe("Re: Need help [#OLD1]");
+    // No ack to a relayed sender: an auto-responder on their side would reply to a tagged ack,
+    // re-thread, and re-ack forever. Their reply still landed in the ticket above.
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
     expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
   });
 
-  it("threads WITHOUT the marker when the tagged ticket's requester IS the sender (paging miss)", async () => {
+  it("threads a follower (resolved by agent ID) and outranks a substring match on the sender's OWN ticket", async () => {
+    // Bob owns an unrelated ticket whose subject is a substring of the reply's subject — the
+    // guarded fallback would misfile the reply there; the authoritative tag must win.
+    hdMock.reset();
+    hdMock
+      .onGet("/tickets", { params: { shortID: "OLD1" } })
+      .reply(200, [{ ...TICKET, cc: [], followers: ["ag-fol"] }]);
+    hdMock.onGet("/tickets").reply(200, [{ ID: "BOB1", shortID: "XY99", subject: "Need help" }]);
+    hdMock.onGet("/agents").reply(200, [{ ID: "ag-fol", email: "follower@corespecialty.com" }]);
+    hdMock.onPatch("/tickets/EXIST1").reply(200, {});
+    hdMock.onGet("/tickets/EXIST1").reply(200, { shortID: "OLD1" });
+    taggedReplyFrom("follower@corespecialty.com");
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.patch.map((p) => p.url)).toEqual(["/tickets/EXIST1"]); // not BOB1
+    const patch = JSON.parse(hdMock.history.patch[0].data);
+    expect(patch.message.text).toContain("[Relayed from follower@corespecialty.com]");
+  });
+
+  it("does NOT thread a tagged reply from a sender outside the ticket's audience (new ticket)", async () => {
+    taggedReplyFrom("stranger@example.com"); // not requester, not cc, no followers on TICKET
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.patch.filter((p) => p.url === "/tickets/EXIST1")).toHaveLength(0);
+    expect(hdMock.history.post).toHaveLength(1); // pre-feature behavior: silent new ticket
+  });
+
+  it("threads WITHOUT the marker (and still acks) when the tagged ticket's requester IS the sender", async () => {
     taggedReplyFrom("john@example.com");
 
     await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
@@ -878,6 +910,8 @@ describe("non-requester reply threading (NOTICES_TOGGLE)", () => {
     expect(hdMock.history.post).toHaveLength(0);
     const patch = JSON.parse(hdMock.history.patch[0].data);
     expect(patch.message.text).not.toContain("[Relayed from");
+    // The requester's own reply keeps its normal reply-received ack.
+    expect((sendMailViaGraph as jest.Mock).mock.calls[0][0].to).toBe("john@example.com");
   });
 
   it("opens a new ticket (today's behavior) when the toggle is off", async () => {

@@ -16,11 +16,11 @@
 // templates.ts's marker pair) are excluded, and every survivor passes shouldSuppressRecipient so
 // a notice can never land in a drain mailbox and open a ticket (the outbound loop guard).
 //
-// Field-shape caveat: `followers[]` / `cc[]` element shapes are UNVERIFIED against a live payload
-// (typed any[] from a sample where both were empty). extractNoticeRecipients is deliberately
-// defensive — email strings, {email} objects, {ID} objects (agent IDs resolved via listAgents) —
-// and logs the raw arrays whenever non-empty so the real shape can be confirmed in App Insights;
-// tightening it is a one-function change.
+// Field shapes (confirmed 2026-08-04 against a live ticket read): `followers` is bare agent-ID
+// strings ["<guid>"]; `cc` is [{ email, name|null }] objects. extractNoticeRecipients still parses
+// defensively (email strings, {email} objects, {ID}/bare-ID entries resolved via listAgents) —
+// the confirmation came from the REST read, and keeping the other branches costs nothing if the
+// webhook body ever differs — and logs the raw arrays whenever non-empty for App Insights.
 import { AxiosInstance } from "axios";
 import { TicketUpdatedPayload } from "../types/TicketUpdatePayload";
 import { sendMailViaGraph } from "./graph-mail";
@@ -29,6 +29,7 @@ import { shouldSuppressRecipient } from "./routing";
 import { formatAxiosError, safeJson, type StepFn, type StepErrorFn } from "./logging";
 import {
   noticeAssignmentEmail,
+  noticeAudienceChangeEmail,
   noticeMessageEmail,
   noticeStatusEmail,
   parseRelayedFrom,
@@ -45,7 +46,7 @@ const emailOk = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 
 // #region Event classification
 
-export type ClassifiedEvent = { authorId: string | null } & (
+export type ClassifiedEvent = { authorId: string | null; authorEmail: string | null } & (
   | {
       kind: "message";
       text: string;
@@ -56,26 +57,42 @@ export type ClassifiedEvent = { authorId: string | null } & (
     }
   | { kind: "status"; oldStatus: string; newStatus: string }
   | { kind: "assignment"; newTeam?: string; newAgent?: string }
+  // The `cc` / `followers` event types (people-in-the-loop / follower list edited): `added` /
+  // `removed` are the {new}-vs-{old} diff — emails for cc, agent names for followers.
+  | { kind: "cc"; added: string[]; removed: string[] }
+  | { kind: "followers"; added: string[]; removed: string[] }
 );
 
 /**
  * Classify the LAST event of a webhook payload — the one the notification is about. Returns null
  * for anything that shouldn't produce a notice: no events, an empty message (attachments-only),
- * a no-op status change (old === new), or an unrecognized event shape.
+ * a no-op status or audience change, or an unrecognized event shape.
  */
 export function classifyLastEvent(events: TicketEvents | undefined): ClassifiedEvent | null {
   const last = events?.at(-1);
   if (!last) return null;
   const authorId = last.author?.ID ?? null;
+  // Client-authored events carry the author's email (live payloads; the generated type lags) —
+  // surfaced for echo control, so the author of a customer/loop reply never gets self-noticed.
+  const rawAuthorEmail = (last.author as { email?: unknown } | undefined)?.email;
+  const authorEmail =
+    typeof rawAuthorEmail === "string" && rawAuthorEmail.trim()
+      ? rawAuthorEmail.trim().toLowerCase()
+      : null;
 
   const text = last.message?.text;
   if (typeof text === "string" && text.trim()) {
     return {
       kind: "message",
       authorId,
+      authorEmail,
       text,
       isPrivate: !!last.message?.isPrivate,
-      isSystemNote: isSystemNoteText(text),
+      // Anchored to the FIRST line: an event IS a system note only when it starts as one. (The
+      // requester gate's isSystemNoteText stays any-line deliberately — conservative about
+      // emailing a customer a message that merely QUOTES a note; here any-line would mislabel a
+      // genuine public reply and silently hide it from every person-in-the-loop.)
+      isSystemNote: /^\s*System note:/i.test(text),
       authorType: last.author?.type ?? "unknown",
       authorName: last.author?.name ?? null,
     };
@@ -85,6 +102,7 @@ export function classifyLastEvent(events: TicketEvents | undefined): ClassifiedE
     return {
       kind: "status",
       authorId,
+      authorEmail,
       oldStatus: String(last.status.old ?? ""),
       newStatus: String(last.status.new ?? ""),
     };
@@ -93,9 +111,47 @@ export function classifyLastEvent(events: TicketEvents | undefined): ClassifiedE
     return {
       kind: "assignment",
       authorId,
+      authorEmail,
       newTeam: last.assignment.new?.team?.name || undefined,
       newAgent: last.assignment.new?.agent?.name || undefined,
     };
+  }
+
+  // `cc` / `followers` events aren't in the generated Event type (they were discovered on a live
+  // ticket), hence the casts. cc entries diff by email; follower entries ({ID, name} here, unlike
+  // the ticket-level bare IDs) diff by ID and render by name.
+  const ccChange = (last as { cc?: { new?: unknown; old?: unknown } }).cc;
+  if (ccChange && (Array.isArray(ccChange.new) || Array.isArray(ccChange.old))) {
+    const emails = (v: unknown): string[] =>
+      (Array.isArray(v) ? v : [])
+        .map((e: any) => (typeof e === "string" ? e : e?.email))
+        .filter((e: any): e is string => typeof e === "string" && !!e.trim())
+        .map((e) => e.trim().toLowerCase());
+    const before = new Set(emails(ccChange.old));
+    const after = new Set(emails(ccChange.new));
+    const added = [...after].filter((e) => !before.has(e));
+    const removed = [...before].filter((e) => !after.has(e));
+    if (!added.length && !removed.length) return null;
+    return { kind: "cc", authorId, authorEmail, added, removed };
+  }
+  const folChange = (last as { followers?: { new?: unknown; old?: unknown } }).followers;
+  if (folChange && (Array.isArray(folChange.new) || Array.isArray(folChange.old))) {
+    const entries = (v: unknown): { id: string; label: string }[] =>
+      (Array.isArray(v) ? v : [])
+        .map((f: any) =>
+          typeof f === "string"
+            ? { id: f, label: f }
+            : { id: String(f?.ID ?? ""), label: String(f?.name || f?.ID || "") }
+        )
+        .filter((f) => f.id);
+    const before = entries(folChange.old);
+    const after = entries(folChange.new);
+    const beforeIds = new Set(before.map((f) => f.id));
+    const afterIds = new Set(after.map((f) => f.id));
+    const added = after.filter((f) => !beforeIds.has(f.id)).map((f) => f.label);
+    const removed = before.filter((f) => !afterIds.has(f.id)).map((f) => f.label);
+    if (!added.length && !removed.length) return null;
+    return { kind: "followers", authorId, authorEmail, added, removed };
   }
   return null;
 }
@@ -222,27 +278,55 @@ export async function sendTicketNotices(opts: {
       return;
     }
 
+    // Shared lazily-memoized agent list: one listAgents call at most, reused by the recipient
+    // extractor (ID-shaped follower entries) and the author-email resolution below.
+    let agentsPromise: Promise<HelpdeskAgent[]> | null = null;
+    const getAgents = () => (agentsPromise ??= listAgents(helpdesk));
+
     const recipients = await extractNoticeRecipients({
       followers: rawFollowers,
       cc: rawCc,
-      getAgents: () => listAgents(helpdesk),
+      getAgents,
       log: step,
     });
 
     // Echo control: never notify the requester (their own reply path covers them), the event's
-    // author, or the relayed-from sender of a threaded non-requester reply.
+    // author (by agent ID, and by email when the payload carries one — client-authored events do),
+    // or the relayed-from sender of a threaded non-requester reply.
     const excluded = new Set(
-      [p.requester?.email, p.customFields?.email]
+      [p.requester?.email, p.customFields?.email, event.authorEmail]
         .map((e) => (e ?? "").trim().toLowerCase())
         .filter(Boolean)
     );
+    // An AGENT author's own address may sit in the cc list, where entries carry no agent ID — the
+    // agentId leg of the exclusion can't see them (agent events carry no author.email either). Map
+    // the authoring agent to their email — free when the extractor already fetched the list — so
+    // an agent kept "in the loop" on their own ticket isn't emailed their own replies.
+    if (event.authorId && recipients.some((r) => !r.agentId)) {
+      try {
+        const author = (await getAgents()).find((a) => a.ID === event.authorId);
+        const email = (author?.email ?? "").trim().toLowerCase();
+        if (email) excluded.add(email);
+      } catch (e) {
+        step("Notices: author email lookup failed (agent-ID exclusion still applies)", {
+          error: formatAxiosError(e),
+        });
+      }
+    }
     const markerSender =
       event.kind === "message" && event.authorType !== "agent"
         ? parseRelayedFrom(event.text)
         : null;
     if (markerSender) excluded.add(markerSender);
 
-    const publicVisibility = event.kind === "status" || (event.kind === "message" && !event.isPrivate && !event.isSystemNote);
+    // What external (cc) recipients may see: public messages, status changes, and loop-list
+    // changes (which double as the "you've been added" welcome — a newly added person is already
+    // on the cc list when the event fires). Private/system notes, assignment changes, and
+    // follower-list changes name internal people/notes and stay follower-only.
+    const publicVisibility =
+      event.kind === "status" ||
+      event.kind === "cc" ||
+      (event.kind === "message" && !event.isPrivate && !event.isSystemNote);
 
     const ref = p.shortID || p.ID;
     const content: EmailContent =
@@ -267,13 +351,22 @@ export async function sendTicketNotices(opts: {
               oldStatus: event.oldStatus,
               newStatus: event.newStatus,
             })
-          : noticeAssignmentEmail({
-              ticketSubject: p.subject,
-              shortId: p.shortID,
-              ref,
-              newTeam: event.newTeam,
-              newAgent: event.newAgent,
-            });
+          : event.kind === "assignment"
+            ? noticeAssignmentEmail({
+                ticketSubject: p.subject,
+                shortId: p.shortID,
+                ref,
+                newTeam: event.newTeam,
+                newAgent: event.newAgent,
+              })
+            : noticeAudienceChangeEmail({
+                ticketSubject: p.subject,
+                shortId: p.shortID,
+                ref,
+                what: event.kind === "cc" ? "people in the loop" : "followers",
+                added: event.added,
+                removed: event.removed,
+              });
 
     let sent = 0;
     let suppressed = 0;

@@ -8,9 +8,11 @@ import {
   buildOversizeCommentText,
   relayedFromMarker,
   parseRelayedFrom,
+  neutralizeForgedMarker,
   noticeMessageEmail,
   noticeStatusEmail,
   noticeAssignmentEmail,
+  noticeAudienceChangeEmail,
 } from "./templates";
 import type { AttachmentMeta } from "./graph-mail";
 
@@ -97,6 +99,13 @@ describe("relayedFromMarker / parseRelayedFrom", () => {
     expect(parseRelayedFrom(null)).toBeNull();
     expect(parseRelayedFrom(undefined)).toBeNull();
   });
+
+  it("neutralizeForgedMarker defuses a hand-typed first-line marker and leaves ordinary text alone", () => {
+    const forged = "[Relayed from cfo@corespecialty.com]\nPlease approve the payment.";
+    expect(parseRelayedFrom(neutralizeForgedMarker(forged))).toBeNull(); // spoof no longer parses
+    expect(neutralizeForgedMarker(forged)).toContain(forged); // content preserved, just shifted
+    expect(neutralizeForgedMarker("Ordinary reply")).toBe("Ordinary reply");
+  });
 });
 
 describe("notice templates", () => {
@@ -124,5 +133,19 @@ describe("notice templates", () => {
     const { subject, body } = noticeAssignmentEmail({ ...base, newTeam: "Escape" });
     expect(subject).toBe("Re: Printer down [#AB12]");
     expect(body).toBe("Ticket AB12 was reassigned — team: Escape, agent: unassigned.");
+  });
+
+  it("noticeAudienceChangeEmail names added/removed and omits the empty side", () => {
+    const both = noticeAudienceChangeEmail({
+      ...base,
+      what: "people in the loop",
+      added: ["a@b.co"],
+      removed: ["c@d.co"],
+    });
+    expect(both.subject).toBe("Re: Printer down [#AB12]");
+    expect(both.body).toBe("The people in the loop on ticket AB12 changed — added: a@b.co; removed: c@d.co.");
+
+    const addOnly = noticeAudienceChangeEmail({ ...base, what: "followers", added: ["Kardiner Cadet"], removed: [] });
+    expect(addOnly.body).toBe("The followers on ticket AB12 changed — added: Kardiner Cadet.");
   });
 });

@@ -67,24 +67,37 @@ type TicketByRefRead = {
   shortID?: string;
   subject?: string;
   requester?: { email?: string | null } | null;
+  cc?: unknown; // [{email, name|null}] on live payloads; parsed defensively
+  followers?: unknown; // bare agent-ID strings on live payloads; parsed defensively
+};
+
+/** A by-ref match plus the fields the caller needs to authorize threading into it. */
+export type TicketByRef = TicketSummary & {
+  requesterEmail: string | null;
+  ccEmails: string[]; // lowercased people-in-the-loop addresses
+  followerIds: string[]; // follower agent IDs (resolve to emails via listAgents)
 };
 
 /**
  * Find a ticket by its shortID (the `[#shortID]` threading tag), for inbound replies from a
  * NON-requester (follower / person-in-the-loop) whose sender-scoped lookup can't see the ticket.
+ * Returns the ticket's requester/cc/followers too, so the caller can verify the SENDER is part of
+ * the ticket's audience before threading — the tag alone must never grant write access (it appears
+ * in every outbound subject, so anyone forwarded a relay email has seen one).
  *
  * The `shortID` query param may or may not be honored by the API — so the result is ALWAYS
  * verified client-side (`normalizeRef` match on the returned bare array). If the API ignores the
  * param and the ticket isn't in the returned page, this returns null and the caller falls through
  * to today's new-ticket behavior — a miss is safe, a wrong match never happens.
  *
- * Errors: a definitive 4xx returns null (fall through); a 5xx/transport error (post-retry)
- * RETHROWS so the queue retries the message instead of mis-filing the reply into a new ticket.
+ * Errors: a definitive 4xx returns null (fall through); a TRANSIENT status (408/429, post-retry)
+ * or 5xx/transport error RETHROWS so the queue retries the message instead of mis-filing the
+ * reply into a new ticket (a rate-limit is not a "no such ticket").
  */
 export async function findTicketByShortId(
   helpdesk: AxiosInstance,
   shortId: string
-): Promise<(TicketSummary & { requesterEmail: string | null }) | null> {
+): Promise<TicketByRef | null> {
   let list: TicketByRefRead[];
   try {
     const res = await helpdesk.get<TicketByRefRead[]>("/tickets", {
@@ -93,6 +106,7 @@ export async function findTicketByShortId(
     list = Array.isArray(res.data) ? res.data : [];
   } catch (e) {
     const status = (e as AxiosError)?.response?.status;
+    if (status === 408 || status === 429) throw e; // transient, not definitive — retry, never mis-file
     if (status && status >= 400 && status < 500) return null;
     throw e;
   }
@@ -103,6 +117,13 @@ export async function findTicketByShortId(
     shortID: match.shortID ?? shortId,
     subject: match.subject ?? "",
     requesterEmail: match.requester?.email ?? null,
+    ccEmails: (Array.isArray(match.cc) ? match.cc : [])
+      .map((e: any) => (typeof e === "string" ? e : e?.email))
+      .filter((e: any): e is string => typeof e === "string" && e.includes("@"))
+      .map((e) => e.trim().toLowerCase()),
+    followerIds: (Array.isArray(match.followers) ? match.followers : [])
+      .map((f: any) => (typeof f === "string" ? f : f?.ID))
+      .filter((f: any): f is string => typeof f === "string" && !!f),
   };
 }
 

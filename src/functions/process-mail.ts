@@ -40,11 +40,13 @@ import {
   existingTicketAutoReply,
   appendFolderAndFilenamesToBody,
   buildOversizeCommentText,
+  neutralizeForgedMarker,
   relayedFromMarker,
 } from "./templates";
 import {
   createHelpdeskClient,
   getTicketShortId,
+  listAgents,
   listTicketsByRequester,
   updateTicketMessage,
   createTicket,
@@ -52,7 +54,7 @@ import {
   findTicketByShortId,
   type TicketSummary,
 } from "./helpdesk-client";
-import { extractTicketRef } from "./subject";
+import { extractTicketRef, normalizeRef } from "./subject";
 import { normalizeInbox, normalizeMailboxKey, routeTeam, shouldIgnoreSender, shouldSuppressRecipient } from "./routing";
 import {
   createBufferedLogger,
@@ -427,14 +429,20 @@ async function processSingleMessage(
 
   // Non-requester reply threading (NOTICES_TOGGLE): a follower / person-in-the-loop replying to a
   // notice carries the [#shortID] tag, but the sender-scoped lookup above can't see the ticket
-  // (they aren't its requester) — without this, their reply opens a duplicate ticket. The by-ref
-  // lookup runs BEFORE any side effect (a 5xx rethrows -> queue retry, never a mis-filed reply);
-  // the marker is only attached when the sender genuinely isn't the requester (a paging miss in
-  // the requester-scoped list would otherwise mislabel the requester's own reply).
+  // (they aren't its requester) — without this, their reply opens a duplicate ticket. The tag is
+  // AUTHORITATIVE: it also outranks findExistingTicket's subject-substring fallback picking one of
+  // the sender's OWN tickets (a coincidence like "Printer down" ⊂ "Re: Printer down [#other]"
+  // would otherwise silently misfile the reply). But a tag alone never grants access — it appears
+  // in every outbound subject, so anyone forwarded a relay email has seen one — the SENDER must be
+  // part of the ticket's audience (requester, person-in-the-loop, or follower agent) or the reply
+  // falls through to today's behavior. All lookups run BEFORE any side effect: a transient failure
+  // (5xx/429/listAgents) rethrows -> queue retry, never a mis-filed reply.
   let relayedFrom: string | undefined;
-  if (!existingTicket && noticesEnabled()) {
+  if (noticesEnabled()) {
     const ref = extractTicketRef(parsed.subject);
-    if (ref) {
+    const refMatchedSenderTicket =
+      !!ref && !!existingTicket && normalizeRef(existingTicket.shortID) === normalizeRef(ref);
+    if (ref && !refMatchedSenderTicket) {
       const byRef = await findTicketByShortId(helpdesk, ref);
       step("Helpdesk: ticket lookup by subject ref", {
         ref,
@@ -442,10 +450,30 @@ async function processSingleMessage(
         ticketId: byRef?.ID ?? null,
       });
       if (byRef) {
-        existingTicket = byRef;
         const sender = (parsed.fromAddress ?? "").trim().toLowerCase();
         const requester = (byRef.requesterEmail ?? "").trim().toLowerCase();
-        if (sender && sender !== requester) relayedFrom = parsed.fromAddress;
+        if (sender && sender === requester) {
+          // The requester's own reply that the sender-scoped list missed (e.g. a paging gap).
+          existingTicket = byRef;
+        } else if (sender) {
+          const inAudience =
+            byRef.ccEmails.includes(sender) ||
+            (byRef.followerIds.length > 0 &&
+              (await listAgents(helpdesk)).some(
+                (a) =>
+                  byRef.followerIds.includes(a.ID) &&
+                  (a.email ?? "").trim().toLowerCase() === sender
+              ));
+          if (inAudience) {
+            existingTicket = byRef;
+            relayedFrom = parsed.fromAddress;
+          } else {
+            step("Helpdesk: subject ref ignored — sender not in the ticket's audience", {
+              ref,
+              sender: parsed.fromAddress,
+            });
+          }
+        }
       }
     }
   }
@@ -458,7 +486,10 @@ async function processSingleMessage(
   if (existingTicket) {
     await handleExistingTicket({
       graph, helpdesk, mailbox, parsed, existingTicket, uploadItems,
-      blocked: plan.blocked, suppressAck: reprocess, relayedFrom, step, stepError,
+      // No ack for a RELAYED (non-requester) thread: acking would mail the follower/loop sender a
+      // tagged message, and an auto-responder on their side would reply, re-thread, and re-ack
+      // forever — the ack is the fuel of that loop. Their reply still lands in the ticket.
+      blocked: plan.blocked, suppressAck: reprocess || relayedFrom !== undefined, relayedFrom, step, stepError,
     });
   } else {
     await handleNewTicket({
@@ -522,17 +553,18 @@ async function handleExistingTicket(opts: {
 
   // The marker line attributes a threaded non-requester reply in the Helpdesk UI (the API author
   // is a generic "client") AND lets the webhook's notice pass exclude the sender from the notice
-  // about their own message (templates.ts's marker pair).
+  // about their own message (templates.ts's marker pair). A NON-relayed body is neutralized so a
+  // hand-typed first-line marker can't spoof that attribution.
   const baseText = relayedFrom
     ? `${relayedFromMarker(relayedFrom)}\n\n${parsed.text}`
-    : parsed.text;
+    : neutralizeForgedMarker(parsed.text);
   const messageText = buildTicketMessageText(baseText, uploadedLinks, folderWebUrl);
   await updateTicketMessage({ helpdesk, ticketId: existingTicket.ID, text: messageText, authorType: "client" });
 
-  // Reprocess replays the ticket message but suppresses the customer ack (the original send already
-  // happened, or is being deliberately replayed silently).
+  // Suppressed for a reprocess replay (the original ack already went out) and for a relayed
+  // non-requester thread (acking a tagged mail back at the sender fuels an auto-responder loop).
   if (suppressAck) {
-    step("Reprocess: customer ack suppressed", { ticketId: existingTicket.ID });
+    step("Ack suppressed (reprocess replay or relayed non-requester reply)", { ticketId: existingTicket.ID });
   } else {
     const ack = existingTicketAutoReply({
       inboundSubject: parsed.subject,
@@ -574,7 +606,9 @@ async function handleNewTicket(opts: {
     requesterEmail: parsed.fromAddress,
     requesterName: parsed.fromName ?? parsed.fromAddress,
     teamId,
-    messageText: parsed.text, // full email body, entire thread included (no quote/signature stripping)
+    // Full email body, entire thread included (no quote/signature stripping); a forged first-line
+    // relayed-from marker is neutralized (the notice pass reads markers as attribution).
+    messageText: neutralizeForgedMarker(parsed.text),
     customFields: { email: parsed.fromAddress, inbox: normalizedInbox },
   });
   step("Helpdesk: createTicket complete", { createdTicketId });
@@ -594,7 +628,11 @@ async function handleNewTicket(opts: {
   // message reach the processed-folder move so it is not reprocessed.
   if (folderWebUrl || uploadedLinks.length > 0) {
     try {
-      const messageText = buildTicketMessageText(parsed.text, uploadedLinks, folderWebUrl);
+      const messageText = buildTicketMessageText(
+        neutralizeForgedMarker(parsed.text),
+        uploadedLinks,
+        folderWebUrl
+      );
       await updateTicketMessage({ helpdesk, ticketId: createdTicketId, text: messageText, authorType: "client" });
     } catch (e) {
       stepError("Append attachment links failed (ticket created; not retried)", e, { createdTicketId });

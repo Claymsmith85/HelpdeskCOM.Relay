@@ -6,6 +6,8 @@ export interface TicketUpdatedPayload {
 
 export interface Payload {
     ID:                string;
+    // People in the loop: [{ email: string, name: string | null }] — confirmed 2026-08-04 against a
+    // live ticket read. Left any[] deliberately; ticket-notices.ts parses it defensively.
     cc:                any[];
     spam:              Spam;
     events:            Event[];
@@ -20,6 +22,8 @@ export interface Payload {
     priority:          number;
     createdAt:         Date;
     createdBy:         string;
+    // Followers: bare Helpdesk agent-ID strings ["<guid>"] — confirmed 2026-08-04 against a live
+    // ticket read. Left any[] deliberately; ticket-notices.ts resolves them via listAgents.
     followers:         any[];
     licenseID:         number;
     requester:         Requester;

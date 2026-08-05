@@ -14,10 +14,17 @@ describe("findTicketByShortId", () => {
 
   const tickets = [
     { ID: "T1", shortID: "AAA1", subject: "Other", requester: { email: "other@x.com" } },
-    { ID: "T2", shortID: "AB12", subject: "Printer down", requester: { email: "jane@x.com" } },
+    {
+      ID: "T2",
+      shortID: "AB12",
+      subject: "Printer down",
+      requester: { email: "jane@x.com" },
+      cc: [{ email: "Tommy.K@x.com", name: null }], // live shape
+      followers: ["ag-1"], // live shape: bare agent IDs
+    },
   ];
 
-  it("sends the shortID param and returns the client-side-verified match with requesterEmail", async () => {
+  it("sends the shortID param and returns the verified match with its audience fields", async () => {
     mock.onGet("/tickets").reply(200, tickets);
 
     const found = await findTicketByShortId(client, "AB12");
@@ -28,15 +35,24 @@ describe("findTicketByShortId", () => {
       shortID: "AB12",
       subject: "Printer down",
       requesterEmail: "jane@x.com",
+      ccEmails: ["tommy.k@x.com"],
+      followerIds: ["ag-1"],
     });
   });
 
-  it("matches case-insensitively (normalizeRef) and tolerates a missing requester", async () => {
+  it("matches case-insensitively (normalizeRef) and tolerates missing requester/cc/followers", async () => {
     mock.onGet("/tickets").reply(200, [{ ID: "T3", shortID: "ab12", subject: "S" }]);
 
     const found = await findTicketByShortId(client, "AB12");
 
-    expect(found).toEqual({ ID: "T3", shortID: "ab12", subject: "S", requesterEmail: null });
+    expect(found).toEqual({
+      ID: "T3",
+      shortID: "ab12",
+      subject: "S",
+      requesterEmail: null,
+      ccEmails: [],
+      followerIds: [],
+    });
   });
 
   it("returns null when the response holds no matching shortID (filter ignored by the API)", async () => {
@@ -57,6 +73,15 @@ describe("findTicketByShortId", () => {
 
     mock.reset();
     mock.onGet("/tickets").networkError();
+    await expect(findTicketByShortId(client, "AB12")).rejects.toThrow();
+  });
+
+  it("rethrows on TRANSIENT 429/408 — a rate-limit is not a 'no such ticket'", async () => {
+    mock.onGet("/tickets").reply(429);
+    await expect(findTicketByShortId(client, "AB12")).rejects.toThrow();
+
+    mock.reset();
+    mock.onGet("/tickets").reply(408);
     await expect(findTicketByShortId(client, "AB12")).rejects.toThrow();
   });
 });

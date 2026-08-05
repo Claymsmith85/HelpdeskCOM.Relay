@@ -61,6 +61,49 @@ describe("classifyLastEvent", () => {
     expect(ev).toMatchObject({ kind: "assignment", newTeam: "Escape", newAgent: "Sam" });
   });
 
+  it("classifies a cc (people-in-the-loop) change by email diff — the live payload shape", () => {
+    // Verbatim shape from a real ticket read (2026-08-04): event type "cc", {new, old} lists.
+    const ev = classifyLastEvent([
+      {
+        type: "cc",
+        author: { type: "agent", ID: "ag1", name: "Clayton Smith" },
+        cc: { new: [{ email: "Tommy.Kanger@corespecialty.com" }], old: [] },
+      },
+    ] as any);
+    expect(ev).toMatchObject({
+      kind: "cc",
+      added: ["tommy.kanger@corespecialty.com"],
+      removed: [],
+    });
+  });
+
+  it("classifies a followers change by ID diff, rendering names — the live payload shape", () => {
+    const ev = classifyLastEvent([
+      {
+        type: "followers",
+        author: { type: "agent", ID: "ag1", name: "Clayton Smith" },
+        followers: { new: [{ ID: "a3f9130d", name: "Kardiner Cadet" }], old: [] },
+      },
+    ] as any);
+    expect(ev).toMatchObject({ kind: "followers", added: ["Kardiner Cadet"], removed: [] });
+  });
+
+  it("drops a no-op audience change (new set equals old set)", () => {
+    expect(
+      classifyLastEvent([{ cc: { new: [{ email: "a@b.co" }], old: [{ email: "A@B.co" }] } }] as any)
+    ).toBeNull();
+    expect(
+      classifyLastEvent([{ followers: { new: [{ ID: "x" }], old: [{ ID: "x", name: "N" }] } }] as any)
+    ).toBeNull();
+  });
+
+  it("surfaces the author email of a client-authored event (live payloads carry it)", () => {
+    const ev = classifyLastEvent([
+      { author: { type: "client", email: "Jane@Example.com" }, message: { text: "hi" } },
+    ] as any);
+    expect(ev).toMatchObject({ kind: "message", authorEmail: "jane@example.com" });
+  });
+
   it("returns null for empty/missing events and unrecognized shapes", () => {
     expect(classifyLastEvent(undefined)).toBeNull();
     expect(classifyLastEvent([] as any)).toBeNull();
@@ -157,6 +200,30 @@ describe("extractNoticeRecipients", () => {
     const out = await extractNoticeRecipients({ followers: undefined, cc: "junk", getAgents });
     expect(out).toEqual([]);
   });
+
+  it("handles the CONFIRMED live shapes: bare-GUID follower strings + {email, name|null} cc objects", async () => {
+    getAgents.mockResolvedValue([
+      { ID: "a3f9130d-3140-4e92-9542-9929ef9b6156", email: "kardiner.cadet@corespecialty.com" },
+    ]);
+
+    const out = await extractNoticeRecipients({
+      followers: ["a3f9130d-3140-4e92-9542-9929ef9b6156"],
+      cc: [{ email: "tommy.kanger@corespecialty.com", name: null }],
+      getAgents,
+    });
+
+    expect(out).toEqual(
+      expect.arrayContaining([
+        {
+          email: "kardiner.cadet@corespecialty.com",
+          source: "follower",
+          agentId: "a3f9130d-3140-4e92-9542-9929ef9b6156",
+        },
+        { email: "tommy.kanger@corespecialty.com", source: "cc", agentId: undefined },
+      ])
+    );
+    expect(out).toHaveLength(2);
+  });
 });
 
 // #endregion
@@ -242,6 +309,81 @@ describe("sendTicketNotices", () => {
     await callNotices(payload({ events: [{ author: { type: "agent", ID: "ag9" }, status: { old: "open", new: "solved" } }] }));
     expect(sendMock).toHaveBeenCalledTimes(2);
     expect(sendMock.mock.calls[0][0].body).toBe("Ticket AB12 status changed: open -> solved.");
+  });
+
+  it("sends a loop-list change to both audiences — the newly added person gets their welcome", async () => {
+    // LOOP was just added: the cc event fires with them already on the ticket's cc list.
+    await callNotices(
+      payload({
+        events: [
+          { author: { type: "agent", ID: "ag9" }, cc: { new: [{ email: LOOP }], old: [] } },
+        ],
+      })
+    );
+    expect(sendMock.mock.calls.map((c) => c[0].to).sort()).toEqual([FOLLOWER, LOOP]);
+    expect(sendMock.mock.calls[0][0].body).toBe(
+      `The people in the loop on ticket AB12 changed — added: ${LOOP}.`
+    );
+  });
+
+  it("sends a follower-list change to followers ONLY (names internal agents)", async () => {
+    await callNotices(
+      payload({
+        events: [
+          {
+            author: { type: "agent", ID: "ag9" },
+            followers: { new: [{ ID: "ag1", name: "Fol Lower" }], old: [] },
+          },
+        ],
+      })
+    );
+    expect(sendMock.mock.calls.map((c) => c[0].to)).toEqual([FOLLOWER]);
+    expect(sendMock.mock.calls[0][0].body).toBe(
+      "The followers on ticket AB12 changed — added: Fol Lower."
+    );
+  });
+
+  it("never notifies a client author about their own event (author.email exclusion)", async () => {
+    // The loop person emailed in; Helpdesk attributes the client event to their email.
+    await callNotices(
+      payload({
+        events: [
+          { author: { type: "client", email: LOOP }, message: { text: "from the loop", isPrivate: false } },
+        ],
+      })
+    );
+    expect(sendMock.mock.calls.map((c) => c[0].to)).toEqual([FOLLOWER]);
+  });
+
+  it("never notifies an AGENT author whose own address sits in the cc list (resolved via listAgents)", async () => {
+    // Agent Sam (ag9) is kept "in the loop" by email; agent events carry no author.email, so the
+    // authorId must be mapped to sam's address through the agent list.
+    const SAM = "sam@corespecialty.com";
+    agentsMock.mockResolvedValue([
+      { ID: "ag1", email: FOLLOWER },
+      { ID: "ag9", email: SAM },
+    ]);
+
+    await callNotices(payload({ cc: [{ email: SAM, name: null }] }));
+
+    expect(sendMock.mock.calls.map((c) => c[0].to)).toEqual([FOLLOWER]);
+    expect(agentsMock).toHaveBeenCalledTimes(1); // memoized: extractor + author lookup share one call
+  });
+
+  it("treats a public reply that merely QUOTES a system note as a reply (first-line anchoring)", async () => {
+    await callNotices(
+      payload({
+        events: [
+          {
+            author: { type: "agent", ID: "ag9", name: "Sam" },
+            message: { text: "See below.\nSystem note: file too large", isPrivate: false },
+          },
+        ],
+      })
+    );
+    // Public visibility: both audiences get it, labeled a reply (not a system note).
+    expect(sendMock).toHaveBeenCalledTimes(2);
+    expect(sendMock.mock.calls[0][0].body).toContain("added a reply");
   });
 
   it("never notifies the event's author about their own event", async () => {

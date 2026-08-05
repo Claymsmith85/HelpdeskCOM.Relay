@@ -124,6 +124,18 @@ export function parseRelayedFrom(text: string | null | undefined): string | null
 }
 
 /**
+ * Neutralize a FORGED marker on an inbound body the relay did NOT relay: the marker is trusted
+ * attribution (the notice pass reads it as "who really wrote this" and excludes that address from
+ * its own notice), so a customer starting their reply with a hand-typed marker could impersonate
+ * someone in the notices AND surgically suppress that person's copy. Prefixing a newline moves the
+ * forged line off line 1, where parseRelayedFrom refuses to look. Genuine relayed appends are
+ * built AFTER this runs (real marker + blank line + body), so they are unaffected.
+ */
+export function neutralizeForgedMarker(text: string): string {
+  return parseRelayedFrom(text) ? `\n${text}` : text;
+}
+
+/**
  * Notice for a message event on a ticket (agent reply, customer reply, private note, system note).
  * The subject is threaded so a recipient's reply matches back into the SAME ticket (the inbound
  * worker threads tagged non-requester replies when NOTICES_TOGGLE is on).
@@ -157,6 +169,32 @@ export function noticeStatusEmail(opts: {
   return {
     subject: withTicketRef(`Re: ${ticketSubject}`, shortId),
     body: `Ticket ${ref} status changed: ${oldStatus} -> ${newStatus}.`,
+  };
+}
+
+/**
+ * Notice for a change to the ticket's audience lists — the `cc` ("people in the loop") and
+ * `followers` event types. For a loop change this is also the "you've been added" welcome: a newly
+ * added person is already on the ticket's cc list when the event fires, so they receive it.
+ */
+export function noticeAudienceChangeEmail(opts: {
+  ticketSubject: string;
+  shortId: string | null | undefined;
+  ref: string;
+  what: "people in the loop" | "followers";
+  added: string[]; // emails (cc) or agent names (followers)
+  removed: string[];
+}): EmailContent {
+  const { ticketSubject, shortId, ref, what, added, removed } = opts;
+  const bits = [
+    added.length ? `added: ${added.join(", ")}` : "",
+    removed.length ? `removed: ${removed.join(", ")}` : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+  return {
+    subject: withTicketRef(`Re: ${ticketSubject}`, shortId),
+    body: `The ${what} on ticket ${ref} changed — ${bits}.`,
   };
 }
 
