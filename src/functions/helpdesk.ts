@@ -35,11 +35,18 @@ export async function helpdesk(
 ): Promise<HttpResponseInit> {
   const { step, stepError } = createStepLogger(context);
 
-  // Master mail-flow switch (TICKETING_TOGGLE). When OFF (the default), the webhook does nothing:
-  // no customFields patch, no agent-reply email. Return 200 so Helpdesk treats delivery as handled
-  // and does not retry.
-  if (!ticketingEnabled()) {
-    step("Ticketing disabled (TICKETING_TOGGLE off) — skipping webhook; no email/ticket update");
+  // Gate matrix. TICKETING_TOGGLE drives the REQUESTER flow (customFields patch + requester
+  // emails); NOTICES_TOGGLE drives the follower / people-in-the-loop notice pass INDEPENDENTLY,
+  // so notices can be tested in an environment whose mail flow is off (e.g. Dev — it shares the
+  // Helpdesk account, so its webhook sees the same events). CAUTION: for the same reason, notices
+  // must be ON in only one environment at a time — two apps with NOTICES_TOGGLE on would each
+  // send, double-emailing every follower/cc. (The inbound half of the feature — non-requester
+  // reply threading in process-mail — still requires TICKETING_TOGGLE: with mail flow off,
+  // inbound mail isn't processed at all, so replies to notices strand until ticketing is on.)
+  const ticketingOn = ticketingEnabled();
+  const noticesOn = noticesEnabled();
+  if (!ticketingOn && !noticesOn) {
+    step("Ticketing + notices disabled — skipping webhook; no email/ticket update");
     // Explicit 200 (load-bearing): Helpdesk treats delivery as handled and does NOT retry the webhook.
     return { status: 200, body: "Ticketing disabled" };
   }
@@ -63,7 +70,7 @@ export async function helpdesk(
    * Helpdesk redeliver the webhook and every email would duplicate.
    */
   if (
-    noticesEnabled() &&
+    noticesOn &&
     (payload.eventType === "tickets.create" || payload.eventType === "tickets.update")
   ) {
     try {
@@ -78,6 +85,13 @@ export async function helpdesk(
     } catch (e) {
       stepError("Notices: pass FAILED (ignored)", e, { ticketId: payload.payload.ID });
     }
+  }
+
+  // Notices-only mode: with ticketing off, stop after the notice pass — no customFields patch and
+  // no requester email (the master mail-flow switch keeps its meaning for the requester flow).
+  if (!ticketingOn) {
+    step("Ticketing disabled (TICKETING_TOGGLE off) — notices processed; no ticket update/requester email");
+    return { status: 200, body: "Ticketing disabled (notices only)" };
   }
 
   /**

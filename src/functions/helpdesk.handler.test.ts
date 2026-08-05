@@ -73,16 +73,29 @@ describe("TICKETING_TOGGLE (master mail-flow switch)", () => {
     },
   };
 
-  it("does nothing (no patch, no email) when the toggle is off, and returns a body", async () => {
+  it("does nothing (no patch, no email, no notices) when both toggles are off, and returns a body", async () => {
     process.env.TICKETING_TOGGLE = "false";
 
     const res = await helpdesk(fakeRequest(agentCreate), fakeContext());
 
     expect(patchMock).not.toHaveBeenCalled();
     expect(sendMock).not.toHaveBeenCalled();
+    expect(noticesMock).not.toHaveBeenCalled();
     expect(res.body).toBe("Ticketing disabled");
     // 200 is load-bearing: a non-200 would make Helpdesk retry the webhook.
     expect(res.status).toBe(200);
+  });
+
+  it("NOTICES-ONLY mode: ticketing off + notices on runs the notice pass but no patch/requester email", async () => {
+    process.env.TICKETING_TOGGLE = "false";
+    process.env.NOTICES_TOGGLE = "true";
+
+    const res = await helpdesk(fakeRequest(agentCreate), fakeContext());
+
+    expect(noticesMock).toHaveBeenCalledTimes(1); // notices independent of the mail-flow switch
+    expect(patchMock).not.toHaveBeenCalled(); // requester flow stays dark
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(res.status).toBe(200); // still acked so Helpdesk does not retry
   });
 
   it("does nothing when the toggle is unset (default OFF)", async () => {

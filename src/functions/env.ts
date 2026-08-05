@@ -71,9 +71,14 @@ export function userMgmtEnabled(): boolean {
  * `helpdesk` webhook sends no follower/cc notices and `process-mail` does not thread a
  * `[#shortID]`-tagged reply from a non-requester (it opens a new ticket, today's behavior). One
  * flag gates BOTH halves deliberately: a notice invites a reply, and the reply must thread — the
- * halves are one conversation loop, so enabling only one is an inconsistent ops state. Sub-toggle
- * of `ticketingEnabled` (both handlers already return before this is consulted when ticketing is
- * off). Default-OFF for the same staged-rollout reason as the other `*_TOGGLE`s.
+ * halves are one conversation loop, so enabling only one is an inconsistent ops state.
+ *
+ * The webhook's notice pass runs INDEPENDENTLY of `ticketingEnabled` (notices-only mode, so Dev —
+ * which shares the Helpdesk account and receives the same webhooks — can test notices with its
+ * mail flow off). Because every environment sees the same webhooks, enable notices in ONLY ONE
+ * environment at a time or every follower/cc is double-emailed. The threading half still requires
+ * ticketing (with mail flow off, inbound mail isn't processed at all). Default-OFF for the same
+ * staged-rollout reason as the other `*_TOGGLE`s.
  */
 export function noticesEnabled(): boolean {
   return envFlag(process.env.NOTICES_TOGGLE, false);
