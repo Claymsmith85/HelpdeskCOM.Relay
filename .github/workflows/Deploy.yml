@@ -263,5 +263,10 @@ jobs:
                 "name": "TEAM_SYNC_CRON",
                 "slotSetting": false,
                 "value": "${{ vars.TEAM_SYNC_CRON }}"
-              }
+              },
+              {
+              "name": "TEAM_SYNC_PROTECTED_AGENTS",
+              "slotSetting": false,
+              "value": "${{ vars.TEAM_SYNC_PROTECTED_AGENTS }}"
+            }
             ]

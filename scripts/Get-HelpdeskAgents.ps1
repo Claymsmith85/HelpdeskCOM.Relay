@@ -44,7 +44,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Pat = "ZGMzNjk1MDYtNmU3NS00YTc5LTg2NDgtMTJhNTAwYmJlNDI4OnVzLXNvdXRoMTpsZTI1RWNydk1VdVRIYV9WWF9XSFJ0T3hUc0U=",
+    [string]$Pat = "REVOKED",
     [string]$BaseUrl = 'https://api.helpdesk.com/v1',
     [string]$OutCsv
 )
