@@ -44,21 +44,22 @@ export function envFlag(raw: string | undefined, fallback: boolean): boolean {
 }
 
 /**
- * Switch for inbound mailbox automation (`MAILBOX_DRAIN`). ON lets `process-mail` take the drain
- * lock, list Inbox/Reprocess, fetch messages, and move handled mail to the processed folder. OFF —
- * the default when unset/empty — returns before the lock or any Graph call and leaves mail untouched
- * for a later notification/sweep to catch up. Independent of `TICKET_CREATE`: drain ON + ticket
- * creation OFF deliberately moves mail without a ticket.
+ * Move switch for handled inbound mail (`MAILBOX_DRAIN`). ON moves handled Inbox/Reprocess messages
+ * to the processed folder; it also catches up already-claimed messages without repeating ticket or
+ * acknowledgement side effects. OFF — the default when unset/empty — leaves messages unread and in
+ * place, using per-message storage claims for idempotency when `TICKET_CREATE` is ON. The worker
+ * returns before the lock/Graph only when this and `TICKET_CREATE` are both OFF.
  */
 export function mailboxDrainEnabled(): boolean {
   return envFlag(process.env.MAILBOX_DRAIN, false);
 }
 
 /**
- * Switch for inbound ticket automation (`TICKET_CREATE`). ON lets an active mailbox drain find or
- * create/append tickets, upload attachment links, and add oversize notes. OFF — the default when
- * unset/empty — performs no inbound Helpdesk reads/writes; an enabled drain still moves the message
- * to processed. Reply-received acknowledgements also require `SUBMITTER_REPLIES`, and tagged
+ * Switch for inbound ticket automation (`TICKET_CREATE`). ON makes the worker lock/list/fetch mail,
+ * find or create/append tickets, upload attachment links, and add oversize notes even when
+ * `MAILBOX_DRAIN` is OFF; handled messages are then claimed rather than moved. OFF — the default
+ * when unset/empty — performs no inbound Helpdesk reads/writes; an enabled drain still moves the
+ * message to processed. Reply acknowledgements also require `SUBMITTER_REPLIES`, and tagged
  * non-requester threading also requires `FOLLOWERS_NOTICES`.
  */
 export function ticketCreateEnabled(): boolean {
@@ -90,8 +91,8 @@ export function agentNoticesEnabled(): boolean {
 
 /**
  * Switch for follower / people-in-the-loop notices and their non-requester reply threading
- * (`FOLLOWERS_NOTICES`). ON enables the webhook notice audience and, when `MAILBOX_DRAIN` and
- * `TICKET_CREATE` are also ON, tagged non-requester replies thread into the referenced ticket. OFF —
+ * (`FOLLOWERS_NOTICES`). ON enables the webhook notice audience and, when `TICKET_CREATE` is also
+ * ON, tagged non-requester replies thread into the referenced ticket regardless of drain mode. OFF —
  * the default when unset/empty — sends no follower/cc notices and performs no by-reference inbound
  * lookup. The webhook is dark only when this, `SUBMITTER_REPLIES`, and `AGENT_NOTICES` are all OFF.
  * Dev and Prod share one Helpdesk account, so this webhook-driven flag must be ON in at most one

@@ -2,13 +2,13 @@
 // Per-mailbox distributed lock for the inbound drain (process-mail).
 //
 // WHY THIS EXISTS. process-mail's correctness rests on three guarantees (see CLAUDE.md invariant
-// #4). Two already hold without any locking: at-least-once delivery (the whole-inbox drain +
-// sweep-inbox re-list everything) and idempotency-against-duplicate-NOTIFICATIONS (the
-// move-to-processed step makes a duplicate getMessage 404). The missing one is MUTUAL EXCLUSION
+// #4). Two already hold without any locking: at-least-once delivery (bounded paginated scans plus
+// sweep-inbox retries) and idempotency-against-duplicate-NOTIFICATIONS (move-to-processed when drain
+// is on, create-once per-message claims when it is off). The missing one is MUTUAL EXCLUSION
 // under cross-instance concurrency: on a multi-instance plan, two notifications for two emails that
 // arrive close together produce two queue items that two different instances dequeue and drain at
 // once; both re-list the same inbox and both clear the non-atomic listTicketsByRequester ->
-// createTicket for a message neither has moved yet, so that message gets two tickets and two acks.
+// createTicket before either can move or claim the message, so it gets two tickets and two acks.
 // host.json batchSize:1 only serializes WITHIN one instance, so it cannot close this window.
 //
 // THE FIX. Serialize drains PER MAILBOX with an Azure Storage blob lease — the same primitive the

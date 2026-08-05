@@ -31,12 +31,16 @@
 // ADDING A NEW ALERT: write a definition module (subject + body builders and a thin send wrapper;
 // see seat-alert.ts and sync-failure-alert.ts) and call sendAlert() with a category and a unique
 // throttle key. A new CATEGORY additionally needs a row in team-mapping.ts's ALERT_TEAMS_BY_ENV.
-import { AxiosError, AxiosInstance } from "axios";
+import { AxiosInstance } from "axios";
 import { HelpdeskAgent } from "./helpdesk-client";
 import { sendMailViaGraph } from "./graph-mail";
 import { shouldSuppressRecipient } from "./routing";
 import { formatAxiosError } from "./logging";
-import { buildStorageClient } from "./storage-client";
+import {
+  buildStorageClient,
+  claimCreateOnceBlob,
+  deleteBlobIfExists,
+} from "./storage-client";
 import { AlertCategory, alertTeamsForEnvironment } from "./team-mapping";
 import { envFlag, envPositiveNumber } from "./env";
 
@@ -122,10 +126,6 @@ export function alertBlobName(
   return `alert-${env}-${blobSafe(category)}-${blobSafe(key)}-${dateKey}`;
 }
 
-function blobPath(blob: string): string {
-  return `/${STATE_CONTAINER}/${encodeURIComponent(blob)}`;
-}
-
 /**
  * Try to claim today's alert. Returns true exactly once per blob name across all instances: the
  * `If-None-Match: *` PUT is a storage-atomic create-if-absent, so a concurrent or later invocation
@@ -136,27 +136,12 @@ export async function claimDailyAlert(
   blob: string,
   body: string
 ): Promise<boolean> {
-  try {
-    await client.put(`/${STATE_CONTAINER}?restype=container`);
-  } catch (e) {
-    // 409 ContainerAlreadyExists — fine (another instance, or an earlier day, created it).
-    if ((e as AxiosError)?.response?.status !== 409) throw e;
-  }
-  try {
-    await client.put(blobPath(blob), body, {
-      headers: { "x-ms-blob-type": "BlockBlob", "If-None-Match": "*", "Content-Type": "application/json" },
-    });
-    return true;
-  } catch (e) {
-    const status = (e as AxiosError)?.response?.status;
-    if (status === 409 || status === 412) return false; // already claimed today
-    throw e;
-  }
+  return claimCreateOnceBlob(client, STATE_CONTAINER, blob, body);
 }
 
 /** Give today's claim back so the next run can retry (used when every send failed). */
 async function releaseClaim(client: AxiosInstance, blob: string): Promise<void> {
-  await client.delete(blobPath(blob));
+  await deleteBlobIfExists(client, STATE_CONTAINER, blob);
 }
 
 /**

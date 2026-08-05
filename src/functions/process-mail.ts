@@ -1,9 +1,10 @@
 // src/functions/process-mail.ts
 // Storage-queue worker: the inbound orchestrator. A `notify` HTTP call enqueues
-// { mailbox, messageId }. MAILBOX_DRAIN controls mailbox access + the processed-folder move;
+// { mailbox, messageId }. MAILBOX_DRAIN controls only the processed-folder move;
 // TICKET_CREATE independently controls Helpdesk/attachment work; SUBMITTER_REPLIES controls the
 // existing-ticket ack; FOLLOWERS_NOTICES controls tagged non-requester threading. A NEW ticket is
-// always opened silently. The processed-folder move makes duplicate notifications no-ops.
+// always opened silently. A processed-folder move (drain on) or create-once storage claim (drain
+// off) makes duplicate notifications no-ops.
 //
 // API/identity/routing/logging concerns live in their own modules (helpdesk-client,
 // routing, logging); this file is the workflow + the attachment policy.
@@ -12,6 +13,13 @@ import { AxiosError, AxiosInstance } from "axios";
 
 import { createGraphClientFromEnv, graphConfigFromEnv } from "./graph-client";
 import { acquireDrainLock } from "./drain-lock";
+import {
+  buildMailClaimsClient,
+  claimMessage,
+  isMessageClaimed,
+  messageClaimBlobName,
+  releaseMessageClaim,
+} from "./mail-claims";
 import {
   envInstantMs,
   envPositiveNumber,
@@ -76,15 +84,15 @@ import {
 const DEBUG_EMAIL_TO =
   process.env.DEBUG_EMAIL_TO ?? "clayton.smith@corespecialty.com";
 
-// Folder inbound mail is moved to once handled (idempotency marker).
+// Folder inbound mail is moved to once handled (the primary idempotency marker when drain is on).
 const PROCESSED_FOLDER = process.env.MAIL_PROCESSED_FOLDER ?? "HelpdeskProcessed";
 
 // Folder an admin can drop mail into to have it REPLAYED through the inbound pipeline as if it just
-// arrived. Scanned on every drain (alongside the inbox) so the existing sweep/notification triggers
+// arrived. Scanned on every active worker run (alongside the inbox) so sweep/notification triggers
 // pick it up — no extra subscription. A reprocessed message bypasses the ignore-before cutoff and
-// sends NO customer auto-reply (ticket-only), then moves to PROCESSED_FOLDER like inbox mail so it
-// isn't replayed again. Created on demand (ensureMailFolder) so the drop target always exists. Read
-// once at load.
+// sends NO customer auto-reply (ticket-only). With drain on it moves to PROCESSED_FOLDER; with drain
+// off it stays in Reprocess behind a create-once claim until a later catch-up move. Created on
+// demand (ensureMailFolder) so the drop target always exists. Read once at load.
 const REPROCESS_FOLDER = process.env.MAIL_REPROCESS_FOLDER ?? "Reprocess";
 
 // Attachment policy: PER-FILE raw-size limit for the SharePoint copy. Native mailboxes accept
@@ -98,12 +106,14 @@ const ATTACHMENT_MAX_BYTES = envPositiveNumber(
   DEFAULT_ATTACHMENT_MAX_BYTES
 );
 
-// Continuation output: when the inbox holds more than one drain batch, the worker re-enqueues a
-// drain item for the same mailbox onto its own queue (mirrors notify.ts's enqueue) so a large
-// backlog is fully drained across several short invocations instead of one long one.
+// Continuation output: when either listed folder has eligible work beyond one operation batch, the
+// worker re-enqueues a drain item for the same mailbox onto its own queue (mirrors notify.ts's
+// enqueue) so a large backlog clears across several short invocations instead of one long one.
 const drainQueueOutput = mailQueueOutput();
 
-// Max inbox messages drained per invocation. Must finish within host.json's functionTimeout
+// Max eligible operations per folder per invocation. An operation is either unclaimed message
+// processing or a claimed-message catch-up move; a claimed drain-off skip does not consume the cap.
+// Must finish within host.json's functionTimeout
 // (10 min); host.json's visibilityTimeout is set higher (15 min) so a slow run can't have its
 // queue message re-picked by a second worker mid-drain and double-process. Kept conservative
 // because a single message can carry up to ATTACHMENT_MAX_BYTES (100 MiB) of attachments — the
@@ -150,13 +160,13 @@ export function isBeforeIgnoreCutoff(receivedDateTime: string | null, cutoffMs: 
 
 /**
  * Queue-triggered worker. Each notification is treated as "there is mail to drain": the worker
- * lists the WHOLE inbox for the mailbox and runs the per-message pipeline over every id, not just
- * the notified one. This sweeps up any message whose notification was dropped (e.g. during an app
- * reboot) — it would otherwise sit in the inbox forever with no queue item to trigger it.
+ * walks a bounded set of oldest-first Inbox/Reprocess pages and runs the per-message pipeline over
+ * eligible ids, not just the notified one. This sweeps up messages whose notifications were dropped
+ * (e.g. during an app reboot) without letting one invocation grow without bound.
  *
- * Throws if any message failed so the Functions runtime retries the drain (then poison-queues);
- * idempotency is provided by the move-to-processed step + the getMessage 404 short-circuit, so a
- * retry re-lists and reprocesses only the still-in-inbox failures.
+ * Throws if any message failed so the Functions runtime retries the drain (then poison-queues).
+ * Idempotency is provided by a move/getMessage-404 when drain is on and by a per-message create-once
+ * claim when drain is off, so a retry reprocesses only unfinished work.
  */
 export async function processMail(
   queueItem: unknown,
@@ -164,7 +174,7 @@ export async function processMail(
 ): Promise<void> {
   const { logBuffer, attachBufferedLogger } = createBufferedLogger(context);
   attachBufferedLogger();
-  const { step, stepError } = createStepLogger(context);
+  const { step, stepWarn, stepError } = createStepLogger(context);
 
   const item = normalizeQueueItem(queueItem);
   if (!item) {
@@ -174,13 +184,14 @@ export async function processMail(
   const { mailbox, messageId } = item;
   step("Start: drain inbox", { mailbox, messageId: messageId ?? null });
 
-  // Mailbox action switch (MAILBOX_DRAIN). When OFF (the default), do NOT touch the mailbox: no
-  // lock, no listing, and crucially no move to the processed folder. Mail is left in the inbox so
-  // flipping the toggle back ON catches up the whole backlog on the next drain (sweep-inbox and
-  // live notifications keep enqueuing drains while off). We return WITHOUT throwing so this queue
-  // item is acked cleanly (no poison-queue churn).
-  if (!mailboxDrainEnabled()) {
-    step("Mailbox drain disabled (MAILBOX_DRAIN off) — leaving mailbox untouched");
+  // Read both inbound switches once for a consistent invocation. MAILBOX_DRAIN now controls ONLY
+  // the final move; ticketing still runs while it is off and writes a create-once claim instead.
+  // There is nothing to do only when both switches are off, so that combination returns before the
+  // lock, Graph, or Storage are touched.
+  const drainEnabled = mailboxDrainEnabled();
+  const createTickets = ticketCreateEnabled();
+  if (!drainEnabled && !createTickets) {
+    step("Inbound processing disabled (MAILBOX_DRAIN and TICKET_CREATE off)");
     return;
   }
 
@@ -223,8 +234,8 @@ export async function processMail(
   const lock = await acquireDrainLock(lockKey, { log: (...a: any[]) => step("DrainLock", a) });
   if (!lock) {
     // Another instance is already draining this mailbox. Defer instead of draining concurrently:
-    // re-enqueue a fresh drain item. The holder drains the WHOLE inbox so it almost certainly
-    // already covers this item; the re-enqueue catches anything that arrived after the holder's
+    // re-enqueue a fresh drain item. The holder scans the mailbox and normally covers this item;
+    // the re-enqueue catches anything beyond its snapshot/page/operation budget or arriving after it,
     // listing snapshot, and sweep-inbox is the ultimate backstop. We return WITHOUT throwing so the
     // dequeue count isn't burned toward the poison queue, and the bounded wait inside
     // acquireDrainLock paces this so the re-enqueue isn't a busy loop.
@@ -234,27 +245,41 @@ export async function processMail(
   }
 
   try {
+    const listingLog = (...args: any[]) => step("Graph: listing", args);
+
     // Best-effort inbox listing: on failure, fall back to draining just the notified id (which is
     // exactly the pre-drain behavior), so a transient list failure can't regress single-message
     // delivery. A sweep item has no notified id, so a failed listing simply drains nothing this
     // round and the next sweep retries.
     let inboxIds: string[] = [];
     try {
-      inboxIds = await listInboxMessageIds(graph, mailbox, DRAIN_BATCH_SIZE, IGNORE_BEFORE_ISO);
+      inboxIds = await listInboxMessageIds(
+        graph,
+        mailbox,
+        DRAIN_BATCH_SIZE,
+        IGNORE_BEFORE_ISO,
+        listingLog
+      );
       step("Graph: listInboxMessageIds complete", { count: inboxIds.length, ignoreBefore: IGNORE_BEFORE_ISO });
     } catch (e) {
       stepError("listInboxMessageIds failed; draining notified message only", e, { mailbox });
     }
 
     // Reprocess folder: an admin drops mail here to replay it as if newly arrived. Listed on every
-    // drain so the same triggers (live notification + the sweep) cover it without a dedicated
+    // active worker run so the same triggers (live notification + the sweep) cover it without a dedicated
     // subscription. Best-effort and isolated from the inbox listing — a failure here (e.g. folder
     // create/list) must not regress the inbox drain. No date filter: reprocess bypasses the
     // ignore-before cutoff by design.
     let reprocessIds: string[] = [];
     try {
       const reprocessFolderId = await ensureMailFolder(graph, mailbox, REPROCESS_FOLDER);
-      reprocessIds = await listFolderMessageIds(graph, mailbox, reprocessFolderId, DRAIN_BATCH_SIZE);
+      reprocessIds = await listFolderMessageIds(
+        graph,
+        mailbox,
+        reprocessFolderId,
+        DRAIN_BATCH_SIZE,
+        listingLog
+      );
       if (reprocessIds.length > 0) {
         step("Graph: reprocess folder has mail to replay", { folder: REPROCESS_FOLDER, count: reprocessIds.length });
       }
@@ -262,68 +287,127 @@ export async function processMail(
       stepError("Reprocess folder listing failed; skipping reprocess this round", e, { mailbox, folder: REPROCESS_FOLDER });
     }
 
-    // Always include the triggering id when present (covers eventual-consistency where it isn't
-    // listed yet), deduped and capped to the batch size. A sweep item carries no messageId. Inbox
-    // ids run as normal inbound; reprocess ids run with `reprocess` set (cutoff bypass + ack
-    // suppression). Folder-scoped ids never collide, so no cross-folder dedup is needed. Each folder
-    // keeps its OWN batch cap (rather than sharing one) so a full inbox can't starve reprocess; the
-    // trade-off is a single drain can process up to 2×DRAIN_BATCH_SIZE messages. That's fine for this
-    // low-volume relay — reprocess is a rare manual action — and the continuation drain clears any
-    // overflow in either folder across subsequent invocations.
-    const inboxWorkIds = [...new Set([...inboxIds, ...(messageId ? [messageId] : [])])].slice(0, DRAIN_BATCH_SIZE);
-    const work: { id: string; reprocess: boolean }[] = [
-      ...inboxWorkIds.map((id) => ({ id, reprocess: false })),
-      ...reprocessIds.slice(0, DRAIN_BATCH_SIZE).map((id) => ({ id, reprocess: true })),
-    ];
+    // Always include the triggering id when present (eventual-consistency fallback), preserving
+    // oldest-first listing order and removing duplicates. Folder-scoped ids do not collide. Inbox
+    // and Reprocess share one invocation budget so attachment-heavy work remains bounded per run.
+    const inboxWorkIds = [...new Set([...inboxIds, ...(messageId ? [messageId] : [])])];
+
+    // One authenticated Storage client is shared by every per-message HEAD/PUT/DELETE in this
+    // invocation. Construct it lazily so an empty mailbox does not acquire a token unnecessarily.
+    let claimsClientPromise: Promise<AxiosInstance> | undefined;
+    const claimsClient = () =>
+      (claimsClientPromise ??= buildMailClaimsClient());
 
     let failures = 0;
-    for (const { id, reprocess } of work) {
-      // Abort if the lease was lost mid-drain (a renewal failed, so another instance may now hold
-      // the mailbox). Throwing here lets the queue retry the whole drain under a fresh lease;
-      // already-handled messages 404-skip, so the only re-work is the still-in-inbox remainder.
-      if (lock.lost) {
-        throw new Error("process-mail: drain lock lost mid-drain; aborting so the queue retries under a fresh lease");
-      }
-      try {
-        await processSingleMessage(graph, mailbox, id, step, stepError, reprocess);
-      } catch (e) {
-        failures++;
-        const err = e as AxiosError;
-        const body =
-          (err?.response?.data as any) ?? (err?.message as any) ?? String(e ?? "Unknown error");
-        stepError("Unhandled: error processing message", e, { messageId: id, body: safeJson(body) });
+    let operations = 0;
 
-        // Best-effort, error-only debug email (gated by SEND_DEBUG_EMAIL). One per failed message.
+    const recordMessageFailure = async (id: string, e: unknown, phase: string) => {
+      failures++;
+      const err = e as AxiosError;
+      const body =
+        (err?.response?.data as any) ?? (err?.message as any) ?? String(e ?? "Unknown error");
+      stepError(`Unhandled: ${phase}`, e, { messageId: id, body: safeJson(body) });
+
+      // Best-effort, error-only debug email (gated by SEND_DEBUG_EMAIL). One per failed message.
+      try {
+        await sendDebugEmail({
+          graph,
+          fromMailbox: mailbox,
+          to: DEBUG_EMAIL_TO,
+          originalSubject: "error",
+          debugDump: `Unhandled error (message ${id}, ${phase}):\n${safeJson(body)}`,
+          logBuffer: logBuffer.value,
+        });
+      } catch (sendErr) {
+        stepError("Debug email failed", sendErr, { messageId: id });
+      }
+    };
+
+    const runFolderWork = async (ids: string[], reprocess: boolean): Promise<boolean> => {
+      for (const id of ids) {
+        // Abort if the lease was lost mid-drain. The queue retry obtains a fresh lease; moved or
+        // claimed siblings then skip, so only unfinished work repeats.
+        if (lock.lost) {
+          throw new Error("process-mail: drain lock lost mid-drain; aborting so the queue retries under a fresh lease");
+        }
+
+        const claimName = messageClaimBlobName(lockKey, id);
+        let claimed: boolean;
+        let client: AxiosInstance;
         try {
-          await sendDebugEmail({
-            graph,
-            fromMailbox: mailbox,
-            to: DEBUG_EMAIL_TO,
-            originalSubject: "error",
-            debugDump: `Unhandled error (message ${id}):\n${safeJson(body)}`,
-            logBuffer: logBuffer.value,
+          client = await claimsClient();
+          // Fail closed: this HEAD happens before getMessage and all ticket/ack side effects. A
+          // storage error is isolated to this id, but the message is never processed blind.
+          claimed = await isMessageClaimed(client, claimName);
+        } catch (e) {
+          await recordMessageFailure(id, e, "message claim read failed");
+          continue;
+        }
+
+        if (claimed && !drainEnabled) {
+          step("Message already claimed; leaving it in place while MAILBOX_DRAIN is off", {
+            messageId: id,
+            reprocess,
           });
-        } catch (sendErr) {
-          stepError("Debug email failed", sendErr, { messageId: id });
+          continue;
+        }
+
+        // Only eligible work consumes the invocation cap. Claimed drain-off messages are cheap skips,
+        // which lets unclaimed mail behind a wall of handled-but-unmoved messages remain reachable.
+        // Once the cap is full, keep checking claims only until we prove eligible work remains.
+        if (operations >= DRAIN_BATCH_SIZE) return true;
+        operations++;
+
+        if (claimed) {
+          // Drain was just enabled: file the already-handled message without fetching it or
+          // repeating ticket/ack work, then shed its now-unneeded claim. Keep the claim when the
+          // move fails, or the still-listed message would look new on the next sweep.
+          const moved = await safeMoveToProcessed(graph, mailbox, id, step, stepError);
+          if (moved) {
+            try {
+              await releaseMessageClaim(client, claimName);
+              step("Released message claim after catch-up move", { messageId: id });
+            } catch (e) {
+              stepWarn("Message claim release failed after catch-up move (ignored)", {
+                messageId: id,
+                error: safeJson((e as AxiosError)?.message ?? e),
+              });
+            }
+          }
+          continue;
+        }
+
+        try {
+          await processSingleMessage(graph, mailbox, id, step, stepError, {
+            reprocess,
+            drainEnabled,
+            createTickets,
+            claimClient: client,
+            claimName,
+          });
+        } catch (e) {
+          await recordMessageFailure(id, e, "error processing message");
         }
       }
-    }
+      return false;
+    };
 
-    // If either listing hit the batch cap, the mailbox may hold more mail (inbox or reprocess) than
-    // this run drained: re-enqueue a continuation drain so the backlog clears across several short
-    // invocations instead of one long one that could overrun the visibility timeout. It
-    // self-terminates — each run moves <= batch messages out of each folder, shrinking it until it
-    // fits in a single run. extraOutputs only commit on a successful return, so this is skipped when
-    // we throw below; a backlog left behind by a throw is re-derived on the next notification's drain.
-    if ((inboxIds.length >= DRAIN_BATCH_SIZE || reprocessIds.length >= DRAIN_BATCH_SIZE) && failures === 0) {
+    const inboxRemaining = await runFolderWork(inboxWorkIds, false);
+    const reprocessRemaining = await runFolderWork(reprocessIds, true);
+
+    // Continue only when the fully paginated listings contained eligible work beyond the shared
+    // operation cap. Raw fullness is not enough: an inbox full of claimed, unmoved mail must
+    // self-terminate instead of churning queue items forever. A failure already causes a queue
+    // retry, so extraOutputs is deliberately left unset on that path.
+    if ((inboxRemaining || reprocessRemaining) && failures === 0) {
       context.extraOutputs.set(drainQueueOutput, [JSON.stringify({ mailbox, messageId })]);
       step("Enqueued continuation drain", { mailbox });
     }
 
-    step("Drain complete", { processed: work.length, failures });
+    step("Drain complete", { operations, failures });
 
     // Rethrow so the queue retries the drain (then poison-queues). Successful messages were moved
-    // out of the inbox, so a retry re-lists and reprocesses ONLY the failures.
+    // or claimed, so a retry reprocesses only unfinished failures.
     if (failures > 0) {
       throw new Error(`process-mail: ${failures} message(s) failed during inbox drain`);
     }
@@ -335,9 +419,9 @@ export async function processMail(
 }
 
 /**
- * Process one inbound message end-to-end: fetch it (404 short-circuits as an idempotent skip),
- * find-or-create the Helpdesk ticket, upload attachments, send the ack, then move it to the
- * processed folder. Throws on a genuine error so the drain loop can record the failure (send the
+ * Process one unclaimed inbound message end-to-end: fetch it (404 short-circuits as an idempotent
+ * skip), find-or-create the Helpdesk ticket, upload attachments, send the ack, then move it or write
+ * its no-move claim. Throws on a genuine error so the drain loop can record the failure (send the
  * debug email, retry the drain) without one bad message stranding its siblings.
  */
 async function processSingleMessage(
@@ -346,8 +430,15 @@ async function processSingleMessage(
   messageId: string,
   step: StepFn,
   stepError: StepErrorFn,
-  reprocess = false
+  opts: {
+    reprocess: boolean;
+    drainEnabled: boolean;
+    createTickets: boolean;
+    claimClient: AxiosInstance;
+    claimName: string;
+  }
 ): Promise<void> {
+  const { reprocess, drainEnabled, createTickets, claimClient, claimName } = opts;
   // Idempotency: a duplicate/overlapping drain for an already-moved message 404s here.
   let msg;
   try {
@@ -390,16 +481,20 @@ async function processSingleMessage(
   // attachment-only or subject-less email still creates a ticket and gets an ack, instead of
   // being silently filed away unanswered (quiet data loss).
   if (!parsed.fromAddress) {
-    step("Validate: missing sender address; moving to processed");
-    await safeMoveToProcessed(graph, mailbox, messageId, step, stepError);
+    step("Validate: missing sender address; marking handled");
+    await finalizeHandledMessage({
+      graph, mailbox, messageId, drainEnabled, claimClient, claimName, reprocess, step, stepError,
+    });
     return;
   }
   if (!parsed.subject) parsed.subject = "(no subject)";
   if (!parsed.text) parsed.text = "(no message body)";
 
   if (shouldIgnoreSender(parsed.fromAddress)) {
-    step("Filter: ignored sender; moving to processed", { from: parsed.fromAddress });
-    await safeMoveToProcessed(graph, mailbox, messageId, step, stepError);
+    step("Filter: ignored sender; marking handled", { from: parsed.fromAddress });
+    await finalizeHandledMessage({
+      graph, mailbox, messageId, drainEnabled, claimClient, claimName, reprocess, step, stepError,
+    });
     return;
   }
 
@@ -407,9 +502,11 @@ async function processSingleMessage(
   // mail is consumed and moved to the processed folder without making any Helpdesk request (and
   // without fetching attachments or attempting a requester acknowledgement). This is intentionally
   // destructive from the inbox's point of view; an operator can move a message to Reprocess later.
-  if (!ticketCreateEnabled()) {
+  if (!createTickets) {
     step("Ticket automation off — message moved without ticketing", { messageId });
-    await safeMoveToProcessed(graph, mailbox, messageId, step, stepError);
+    await finalizeHandledMessage({
+      graph, mailbox, messageId, drainEnabled, claimClient, claimName, reprocess, step, stepError,
+    });
     return;
   }
 
@@ -527,7 +624,9 @@ async function processSingleMessage(
     });
   }
 
-  await safeMoveToProcessed(graph, mailbox, messageId, step, stepError);
+  await finalizeHandledMessage({
+    graph, mailbox, messageId, drainEnabled, claimClient, claimName, reprocess, step, stepError,
+  });
   step("Done", { messageId });
 }
 
@@ -735,7 +834,7 @@ async function addOversizeNote(
 
 // #endregion
 
-// #region Outbound mail (ack) + idempotency move
+// #region Outbound mail (ack) + idempotency marker
 
 /**
  * Send a best-effort acknowledgement from the receiving shared mailbox. Validates the to
@@ -775,12 +874,75 @@ async function sendAckEmail(opts: {
 }
 
 /**
+ * Mark a message handled after every ticket/ack side effect has completed. Moving remains the
+ * primary marker when drain is on. With drain off, a create-once blob replaces the move without
+ * changing the mailbox item's folder or read state.
+ *
+ * A claim write failure deliberately mirrors a failed move: log at ERROR but do not throw and
+ * trigger an immediate retry after non-idempotent side effects. The next notification/sweep may
+ * reprocess the message, preserving the existing at-least-once failure window.
+ */
+async function finalizeHandledMessage(opts: {
+  graph: AxiosInstance;
+  mailbox: string;
+  messageId: string;
+  drainEnabled: boolean;
+  claimClient: AxiosInstance;
+  claimName: string;
+  reprocess: boolean;
+  step: StepFn;
+  stepError: StepErrorFn;
+}): Promise<void> {
+  const {
+    graph,
+    mailbox,
+    messageId,
+    drainEnabled,
+    claimClient,
+    claimName,
+    reprocess,
+    step,
+    stepError,
+  } = opts;
+
+  if (drainEnabled) {
+    await safeMoveToProcessed(graph, mailbox, messageId, step, stepError);
+    return;
+  }
+
+  try {
+    const created = await claimMessage(
+      claimClient,
+      claimName,
+      JSON.stringify({
+        claimedAt: new Date().toISOString(),
+        mailbox,
+        messageId,
+        source: reprocess ? "reprocess" : "inbox",
+      })
+    );
+    step(created ? "Claimed handled message" : "Handled message was already claimed", {
+      messageId,
+      reprocess,
+    });
+  } catch (e) {
+    stepError(
+      "Message claim FAILED — message stays in place and WILL be reprocessed/re-acked until this succeeds",
+      e,
+      { messageId, reprocess }
+    );
+  }
+}
+
+/**
  * Move the source message to the processed folder; never throws (the ticket is already
- * created/updated by this point).
+ * created/updated by this point). Returns whether the message is now known to be out of its source
+ * folder, so catch-up mode releases a claim only after a successful/404-idempotent move.
  *
  * The move is the idempotency linchpin, so its failure modes matter:
- *  - A 404 means the message is already gone (a concurrent/duplicate drain moved it). That IS the
- *    idempotent outcome we want — log it at info, not as a failure.
+ *  - A move 404 is ambiguous, so a follow-up get verifies the source id. Only a second 404 proves
+ *    the message is gone and makes the move idempotently complete; any other result fails closed.
+ *    A 404 while resolving the processed folder is never treated as a completed move.
  *  - Any OTHER failure leaves the message in the inbox, where the next drain re-lists it,
  *    re-matches the ticket we just created, and RE-ACKS the customer. The Graph client has
  *    already retried transient 429/503s, so reaching here means it is persistent — surface it at
@@ -793,21 +955,57 @@ async function safeMoveToProcessed(
   messageId: string,
   step: StepFn,
   stepError: StepErrorFn
-): Promise<void> {
+): Promise<boolean> {
+  let folderId: string;
   try {
-    const folderId = await ensureMailFolder(graph, mailbox, PROCESSED_FOLDER);
-    await moveMessageToFolder(graph, mailbox, messageId, folderId);
-    step("Moved message to processed folder", { folder: PROCESSED_FOLDER });
+    folderId = await ensureMailFolder(graph, mailbox, PROCESSED_FOLDER);
   } catch (e) {
-    if ((e as AxiosError)?.response?.status === 404) {
-      step("Move skipped: message already moved (404)", { messageId });
-      return;
-    }
+    // A folder/mailbox lookup 404 says nothing about whether the source message still exists. In
+    // catch-up mode, returning false preserves its claim and therefore fails closed.
     stepError(
-      "Move to processed FAILED — message stays in inbox and WILL be reprocessed/re-acked until this succeeds",
+      "Resolve processed folder FAILED — message move not attempted",
       e,
       { messageId, folder: PROCESSED_FOLDER }
     );
+    return false;
+  }
+
+  try {
+    await moveMessageToFolder(graph, mailbox, messageId, folderId);
+    step("Moved message to processed folder", { folder: PROCESSED_FOLDER });
+    return true;
+  } catch (e) {
+    if ((e as AxiosError)?.response?.status === 404) {
+      // Graph can return the same 404 status for a missing source message and for other move-path
+      // resources. Verify the source id before calling the move idempotent; otherwise catch-up
+      // could release a valid claim while the email still exists and repeat ticket/ack side effects.
+      try {
+        await getMessage(graph, mailbox, messageId);
+        stepError(
+          "Move returned 404 but source message still exists — preserving idempotency state",
+          e,
+          { messageId, folder: PROCESSED_FOLDER }
+        );
+        return false;
+      } catch (verifyError) {
+        if ((verifyError as AxiosError)?.response?.status === 404) {
+          step("Move verified complete: source message no longer exists", { messageId });
+          return true;
+        }
+        stepError(
+          "Move returned 404 and source-message verification failed — preserving idempotency state",
+          verifyError,
+          { messageId, folder: PROCESSED_FOLDER }
+        );
+        return false;
+      }
+    }
+    stepError(
+      "Move to processed FAILED — message stays in its source folder; the move will be retried",
+      e,
+      { messageId, folder: PROCESSED_FOLDER }
+    );
+    return false;
   }
 }
 
@@ -879,7 +1077,7 @@ export function normalizeQueueItem(queueItem: unknown): MailQueueItem | null {
   const mailbox = obj?.mailbox;
   const messageId = obj?.messageId;
   // mailbox is required. messageId is optional — a sweep item (from sweep-inbox) omits it and
-  // means "drain this mailbox's whole inbox" — but if present it must be a non-empty string.
+  // means "scan this mailbox for bounded work" — but if present it must be a non-empty string.
   if (typeof mailbox !== "string" || !mailbox) return null;
   if (messageId !== undefined && (typeof messageId !== "string" || !messageId)) return null;
   return messageId ? { mailbox, messageId } : { mailbox };

@@ -62,6 +62,13 @@ type GraphAttachment = {
 const MESSAGE_SELECT =
   "id,subject,from,sender,toRecipients,replyTo,body,bodyPreview,hasAttachments,receivedDateTime";
 
+/**
+ * Bound folder walks when handled-but-unmoved mail remains visible in Graph. The worker passes its
+ * per-run batch size as `$top`, so a listing normally examines at most
+ * `MAIL_MESSAGE_LIST_PAGE_BUDGET * batchSize` messages before returning what it found.
+ */
+export const MAIL_MESSAGE_LIST_PAGE_BUDGET = 10;
+
 // #endregion
 
 // #region Inbound (read)
@@ -105,9 +112,10 @@ export function parseGraphMessage(msg: GraphMessage): InboundMessage {
 
 /**
  * Shared id-only, oldest-first, paged listing of a mail-folder resource. `$select=id` keeps the
- * response light no matter how large the messages' attachments are; paging follows
- * `@odata.nextLink` until `max` ids are collected. `folderResource` is the folder's addressing
- * segment — the well-known `mailFolders('inbox')` or a `mailFolders/{id}` path.
+ * response light no matter how large the messages' attachments are; `pageSize` is only the Graph
+ * `$top` hint, not a cap on returned ids. Paging follows Graph's `@odata.nextLink` unchanged until
+ * the folder is exhausted or `MAIL_MESSAGE_LIST_PAGE_BUDGET` is reached. `folderResource` is the
+ * folder's addressing segment — the well-known `mailFolders('inbox')` or a `mailFolders/{id}` path.
  *
  * `receivedAfterIso` (optional, ISO-8601 UTC) restricts the listing to mail received at/after the
  * cutoff via a server-side `$filter=receivedDateTime ge ...`. Because the listing is `$orderby`ed
@@ -118,23 +126,38 @@ async function listFolderMessageIdsByResource(
   graph: AxiosInstance,
   mailbox: string,
   folderResource: string,
-  max: number,
-  receivedAfterIso?: string
+  pageSize: number,
+  receivedAfterIso?: string,
+  log?: (...args: any[]) => void
 ): Promise<string[]> {
+  const normalizedPageSize = Math.floor(pageSize);
+  if (!Number.isFinite(normalizedPageSize) || normalizedPageSize <= 0) return [];
+
   const ids: string[] = [];
+  let pages = 0;
   let url: string | null =
     `/users/${encodeURIComponent(mailbox)}/${folderResource}/messages` +
-    `?$select=id&$orderby=receivedDateTime asc&$top=50` +
+    `?$select=id&$orderby=receivedDateTime asc&$top=${normalizedPageSize}` +
     (receivedAfterIso ? `&$filter=receivedDateTime ge ${receivedAfterIso}` : "");
 
-  while (url && ids.length < max) {
+  while (url && pages < MAIL_MESSAGE_LIST_PAGE_BUDGET) {
     const res: { data: { value?: { id: string }[]; "@odata.nextLink"?: string } } =
       await graph.get(url);
     for (const m of res.data?.value ?? []) {
       if (m?.id) ids.push(m.id);
-      if (ids.length >= max) break;
     }
-    url = ids.length < max ? res.data?.["@odata.nextLink"] ?? null : null;
+    pages++;
+    url = res.data?.["@odata.nextLink"] ?? null;
+  }
+
+  if (url) {
+    log?.("Graph mail listing truncated at page budget", {
+      mailbox,
+      folderResource,
+      pageBudget: MAIL_MESSAGE_LIST_PAGE_BUDGET,
+      pageSize: normalizedPageSize,
+      ids: ids.length,
+    });
   }
 
   return ids;
@@ -142,27 +165,31 @@ async function listFolderMessageIdsByResource(
 
 /**
  * List the ids of messages currently in a mailbox's **inbox folder**, oldest-first. Uses the same
- * `mailFolders('inbox')` resource the subscription targets (see subscriptions.ts) — so this is
- * exactly the set of "outstanding" mail (handled mail is moved out to the processed folder). Used
- * by the worker to drain the whole inbox on each notification, catching anything whose
+ * `mailFolders('inbox')` resource the subscription targets (see subscriptions.ts). In drain-off
+ * mode it includes handled-but-claimed messages, so the worker checks claims before fetching and
+ * applying its action cap. Walking the inbox on each notification/sweep catches anything whose
  * notification was dropped (e.g. an app reboot).
  *
  * `receivedAfterIso` is how the drain ignores a pre-go-live backlog: old mail is never even listed,
  * so it is left untouched in the inbox rather than ticketed/auto-replied. Oldest-first ordering
  * means that without the filter the drain would otherwise process the OLDEST mail first.
+ * `pageSize` controls Graph's `$top`; this may return more than `pageSize` ids across pages so the
+ * worker can discard claimed ids before applying its per-run work cap.
  */
 export function listInboxMessageIds(
   graph: AxiosInstance,
   mailbox: string,
-  max: number,
-  receivedAfterIso?: string
+  pageSize: number,
+  receivedAfterIso?: string,
+  log?: (...args: any[]) => void
 ): Promise<string[]> {
   return listFolderMessageIdsByResource(
     graph,
     mailbox,
     "mailFolders('inbox')",
-    max,
-    receivedAfterIso
+    pageSize,
+    receivedAfterIso,
+    log
   );
 }
 
@@ -171,19 +198,22 @@ export function listInboxMessageIds(
  * reprocess drain: messages an admin drops into the Reprocess folder are replayed through the
  * inbound pipeline as if newly arrived. Deliberately takes NO `receivedAfterIso` — reprocess
  * bypasses the ignore-before cutoff (the whole point of moving old mail into Reprocess is to force
- * it through).
+ * it through). `pageSize` is Graph's `$top`, not a total-result cap.
  */
 export function listFolderMessageIds(
   graph: AxiosInstance,
   mailbox: string,
   folderId: string,
-  max: number
+  pageSize: number,
+  log?: (...args: any[]) => void
 ): Promise<string[]> {
   return listFolderMessageIdsByResource(
     graph,
     mailbox,
     `mailFolders/${encodeURIComponent(folderId)}`,
-    max
+    pageSize,
+    undefined,
+    log
   );
 }
 

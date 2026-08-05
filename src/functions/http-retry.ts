@@ -1,8 +1,8 @@
 // src/functions/http-retry.ts
 // Shared axios retry policy for the Graph + Helpdesk clients. Graph throttles aggressively
 // (429 + Retry-After) and any HTTP boundary can return a transient 503 or drop the connection.
-// Without this, a single such blip throws straight out of the pipeline and lands the whole inbox
-// drain on the queue's coarse retry (which re-lists every message and ignores Retry-After). This
+// Without this, a single such blip throws straight out of the pipeline and lands the bounded mailbox
+// scan on the queue's coarse retry (which re-lists/rechecks work and ignores Retry-After). This
 // absorbs the common transient case in place, honoring Retry-After, before it reaches that
 // sledgehammer.
 //

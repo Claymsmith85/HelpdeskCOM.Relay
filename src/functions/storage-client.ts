@@ -2,14 +2,14 @@
 // Shared Azure Blob Storage REST client (axios + the user-assigned managed identity).
 //
 // Extracted from drain-lock.ts so more than one caller can talk to the AzureWebJobsStorage account
-// without each re-deriving the endpoint/token: drain-lock.ts takes per-mailbox blob leases, and
-// seat-alert.ts writes a once-per-day claim blob. Auth is the SAME identity the runtime already
-// uses for identity-based AzureWebJobsStorage, so the storage RBAC (Blob Data Contributor) is
-// already in place — no new grant is needed for a new caller.
+// without each re-deriving the endpoint/token: drain-lock.ts takes per-mailbox blob leases, while
+// alerts.ts and mail-claims.ts use the create-once/existence/delete primitives below. Auth is the
+// SAME identity the runtime already uses for identity-based AzureWebJobsStorage, so the storage
+// RBAC (Blob Data Contributor) is already in place — no new grant is needed for a new caller.
 //
 // WHY REST (not @azure/storage-blob): the codebase talks to Azure over raw axios (graph-mail.ts,
 // sharepoint.ts) and avoids the heavy Azure SDKs. See drain-lock.ts's header for the full rationale.
-import axios, { AxiosInstance } from "axios";
+import axios, { AxiosError, AxiosInstance } from "axios";
 import { DefaultAzureCredential } from "@azure/identity";
 import { attachRetryInterceptor } from "./http-retry";
 
@@ -25,6 +25,129 @@ export type StorageClientOptions = {
   // Optional per-caller override for the account name (drain-lock honours DRAIN_LOCK_ACCOUNT_NAME).
   accountName?: string;
 };
+
+function blobPath(container: string, blob: string): string {
+  return `/${container}/${encodeURIComponent(blob)}`;
+}
+
+/** Read Azure Storage's machine-readable error code from a response header or XML body. */
+function storageErrorCode(error: unknown): string | undefined {
+  const response = (error as AxiosError)?.response;
+  const headers = response?.headers as
+    | { get?: (name: string) => unknown; [name: string]: unknown }
+    | undefined;
+  const fromHeader = headers?.get?.("x-ms-error-code") ?? headers?.["x-ms-error-code"];
+  if (typeof fromHeader === "string" && fromHeader) return fromHeader;
+
+  const body = response?.data;
+  if (typeof body === "string") {
+    return /<Code>([^<]+)<\/Code>/i.exec(body)?.[1];
+  }
+  return undefined;
+}
+
+function isStorageError(error: unknown, status: number, ...codes: string[]): boolean {
+  return (
+    (error as AxiosError)?.response?.status === status &&
+    codes.includes(storageErrorCode(error) ?? "")
+  );
+}
+
+// One process-mail invocation reuses one Axios client for many claims. Memoize the container ensure
+// promise per client/container so the warm path does not emit an expected 409 for every message.
+// A rejected ensure is removed so a later call can retry rather than caching a transient failure.
+const containerEnsures = new WeakMap<AxiosInstance, Map<string, Promise<void>>>();
+
+async function ensureContainer(client: AxiosInstance, container: string): Promise<void> {
+  let byContainer = containerEnsures.get(client);
+  if (!byContainer) {
+    byContainer = new Map<string, Promise<void>>();
+    containerEnsures.set(client, byContainer);
+  }
+
+  let pending = byContainer.get(container);
+  if (!pending) {
+    pending = (async () => {
+      try {
+        await client.put(`/${container}?restype=container`);
+      } catch (e) {
+        if (!isStorageError(e, 409, "ContainerAlreadyExists")) throw e;
+      }
+    })();
+    byContainer.set(container, pending);
+  }
+
+  try {
+    await pending;
+  } catch (e) {
+    if (byContainer.get(container) === pending) byContainer.delete(container);
+    throw e;
+  }
+}
+
+/**
+ * Atomically create a block blob if it does not already exist.
+ *
+ * Returns true when this call created the blob and false when another call already created it.
+ * Container creation is deliberately idempotent: a fresh deployment creates it on first use,
+ * while the normal already-exists response is treated as success. All unexpected storage errors
+ * propagate so callers can fail closed.
+ */
+export async function claimCreateOnceBlob(
+  client: AxiosInstance,
+  container: string,
+  blob: string,
+  body: string
+): Promise<boolean> {
+  await ensureContainer(client, container);
+
+  try {
+    await client.put(blobPath(container, blob), body, {
+      headers: {
+        "x-ms-blob-type": "BlockBlob",
+        "If-None-Match": "*",
+        "Content-Type": "application/json",
+      },
+    });
+    return true;
+  } catch (e) {
+    if (
+      isStorageError(e, 409, "BlobAlreadyExists") ||
+      isStorageError(e, 412, "ConditionNotMet")
+    ) {
+      return false;
+    }
+    throw e;
+  }
+}
+
+/** Return whether a blob exists. Only Blob/ContainerNotFound is mapped to false. */
+export async function blobExists(
+  client: AxiosInstance,
+  container: string,
+  blob: string
+): Promise<boolean> {
+  try {
+    await client.head(blobPath(container, blob));
+    return true;
+  } catch (e) {
+    if (isStorageError(e, 404, "BlobNotFound", "ContainerNotFound")) return false;
+    throw e;
+  }
+}
+
+/** Delete a blob if present. A missing blob/container is already the desired state. */
+export async function deleteBlobIfExists(
+  client: AxiosInstance,
+  container: string,
+  blob: string
+): Promise<void> {
+  try {
+    await client.delete(blobPath(container, blob));
+  } catch (e) {
+    if (!isStorageError(e, 404, "BlobNotFound", "ContainerNotFound")) throw e;
+  }
+}
 
 /**
  * Build the storage REST client: baseURL = the blob service endpoint, app-only bearer token from

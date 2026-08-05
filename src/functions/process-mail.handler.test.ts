@@ -1,7 +1,7 @@
 // Workflow tests for the queue worker (process-mail.ts).
 //
 // What these lock in:
-//   - ignored senders are skipped (no ticket) but still moved to the processed folder
+//   - ignored senders are skipped (no ticket) and finalized by move or no-move claim
 //   - the new-ticket happy path: create ticket (real requester + routed team) SILENTLY — no
 //     "ticket created" notice is sent to the requester — then move to processed
 //   - the existing-ticket path uploads attachments and appends folder + filenames
@@ -54,6 +54,16 @@ jest.mock("./drain-lock", () => ({
     .fn()
     .mockResolvedValue({ mailbox: "MB-GUID", lost: false, release: jest.fn().mockResolvedValue(undefined) }),
 }));
+// Per-message no-move claims: mocked at the module boundary so worker tests can exercise the
+// claim-first control flow without talking to Azure Storage. mail-claims.test.ts owns the REST
+// details; these tests own ordering and workflow effects.
+jest.mock("./mail-claims", () => ({
+  buildMailClaimsClient: jest.fn().mockResolvedValue({ id: "claims" }),
+  messageClaimBlobName: jest.fn((mailbox: string, id: string) => `claim:${mailbox}:${id}`),
+  isMessageClaimed: jest.fn().mockResolvedValue(false),
+  claimMessage: jest.fn().mockResolvedValue(true),
+  releaseMessageClaim: jest.fn().mockResolvedValue(undefined),
+}));
 
 import axios, { AxiosInstance } from "axios";
 import MockAdapter from "axios-mock-adapter";
@@ -74,6 +84,12 @@ import {
 } from "./graph-mail";
 import { uploadAttachmentsToSharePoint } from "./sharepoint";
 import { acquireDrainLock } from "./drain-lock";
+import {
+  buildMailClaimsClient,
+  claimMessage,
+  isMessageClaimed,
+  releaseMessageClaim,
+} from "./mail-claims";
 
 const TEAM_ESCAPE = "3db812da-2055-436f-9889-7073b5e976f4";
 const MAILBOX = "MB-GUID";
@@ -127,7 +143,14 @@ beforeEach(() => {
   (listFolderMessageIds as jest.Mock).mockResolvedValue([]);
   (listMessageAttachments as jest.Mock).mockResolvedValue([]);
   (resolveMailboxAddress as jest.Mock).mockResolvedValue("escape@corespecialty.com");
+  (ensureMailFolder as jest.Mock).mockImplementation((_g: any, _mb: any, name: string) =>
+    Promise.resolve(name === "Reprocess" ? "reprocess-folder-id" : "processed-folder-id")
+  );
   (uploadAttachmentsToSharePoint as jest.Mock).mockResolvedValue(null);
+  (buildMailClaimsClient as jest.Mock).mockResolvedValue({ id: "claims" });
+  (isMessageClaimed as jest.Mock).mockResolvedValue(false);
+  (claimMessage as jest.Mock).mockResolvedValue(true);
+  (releaseMessageClaim as jest.Mock).mockResolvedValue(undefined);
 
   helpdeskInstance = axios.create();
   hdMock = new MockAdapter(helpdeskInstance);
@@ -145,9 +168,10 @@ afterEach(() => {
   delete process.env.FOLLOWERS_NOTICES;
 });
 
-describe("MAILBOX_DRAIN (mailbox action switch)", () => {
-  it("does nothing when the toggle is off — no lock, no listing, no ticket/ack, no move", async () => {
+describe("MAILBOX_DRAIN (processed-folder move switch)", () => {
+  it("does nothing when drain and ticket creation are both off — no lock or listing", async () => {
     process.env.MAILBOX_DRAIN = "false";
+    process.env.TICKET_CREATE = "false";
 
     await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
 
@@ -160,10 +184,12 @@ describe("MAILBOX_DRAIN (mailbox action switch)", () => {
     expect(hdMock.history.post).toHaveLength(0);
     expect(sendMailViaGraph).not.toHaveBeenCalled();
     expect(moveMessageToFolder).not.toHaveBeenCalled(); // mail left untouched -> caught up on re-enable
+    expect(buildMailClaimsClient).not.toHaveBeenCalled();
   });
 
-  it("does nothing when the toggle is unset (default OFF)", async () => {
+  it("does nothing when both toggles are unset (default OFF)", async () => {
     delete process.env.MAILBOX_DRAIN;
+    delete process.env.TICKET_CREATE;
 
     await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
 
@@ -172,6 +198,197 @@ describe("MAILBOX_DRAIN (mailbox action switch)", () => {
     expect(listInboxMessageIds).not.toHaveBeenCalled();
     expect(listFolderMessageIds).not.toHaveBeenCalled();
     expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(buildMailClaimsClient).not.toHaveBeenCalled();
+  });
+
+  it("tickets and acks once with drain off, then skips the same claimed message on re-drain", async () => {
+    process.env.MAILBOX_DRAIN = "false";
+    (isMessageClaimed as jest.Mock)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const existing = { ID: "EXIST1", shortID: "OLD1", subject: "Need help" };
+    hdMock.onGet("/tickets").reply(200, [existing]);
+    hdMock.onPatch("/tickets/EXIST1").reply(200, {});
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.patch).toHaveLength(1); // existing ticket appended
+    expect(sendMailViaGraph).toHaveBeenCalledTimes(1); // submitter ack still works
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(claimMessage).toHaveBeenCalledTimes(1);
+    expect(claimMessage).toHaveBeenCalledWith(
+      { id: "claims" },
+      "claim:escape@corespecialty.com:M1",
+      expect.any(String)
+    );
+    expect(acquireDrainLock).toHaveBeenCalledTimes(1);
+    expect((acquireDrainLock as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(
+      (isMessageClaimed as jest.Mock).mock.invocationCallOrder[0]
+    );
+    expect((isMessageClaimed as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(
+      (getMessage as jest.Mock).mock.invocationCallOrder[0]
+    );
+    expect((sendMailViaGraph as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(
+      (claimMessage as jest.Mock).mock.invocationCallOrder[0]
+    ); // the no-move marker is written only after the non-idempotent side effects
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(getMessage).toHaveBeenCalledTimes(1);
+    expect(hdMock.history.patch).toHaveLength(1);
+    expect(sendMailViaGraph).toHaveBeenCalledTimes(1);
+    expect(claimMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("creates a new ticket with drain off, keeps the normal silent-create rule, and claims it", async () => {
+    process.env.MAILBOX_DRAIN = "false";
+    hdMock.onGet("/tickets").reply(200, []);
+    hdMock.onPost("/tickets").reply(200, { ID: "NEW1" });
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(1);
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(claimMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips all fetch/ticket/ack work when a drain-off message is already claimed", async () => {
+    process.env.MAILBOX_DRAIN = "false";
+    (isMessageClaimed as jest.Mock).mockResolvedValue(true);
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(getMessage).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(hdMock.history.get).toHaveLength(0);
+    expect(hdMock.history.post).toHaveLength(0);
+    expect(hdMock.history.patch).toHaveLength(0);
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(claimMessage).not.toHaveBeenCalled();
+  });
+
+  it("catches up a claimed message when drain turns on without repeating ticket work", async () => {
+    (isMessageClaimed as jest.Mock).mockResolvedValue(true);
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(getMessage).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+    expect(releaseMessageClaim).toHaveBeenCalledWith(
+      { id: "claims" },
+      "claim:escape@corespecialty.com:M1"
+    );
+    expect((moveMessageToFolder as jest.Mock).mock.invocationCallOrder[0]).toBeLessThan(
+      (releaseMessageClaim as jest.Mock).mock.invocationCallOrder[0]
+    );
+  });
+
+  it("keeps a catch-up claim when the processed-folder move fails", async () => {
+    (isMessageClaimed as jest.Mock).mockResolvedValue(true);
+    (moveMessageToFolder as jest.Mock).mockRejectedValueOnce({ response: { status: 500 } });
+    const ctx = fakeContext();
+    const errorSink = ctx.error;
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, ctx);
+
+    expect(getMessage).not.toHaveBeenCalled();
+    expect(releaseMessageClaim).not.toHaveBeenCalled();
+    expect(errorSink).toHaveBeenCalledWith(
+      expect.stringContaining("Move to processed FAILED"),
+      expect.anything()
+    );
+  });
+
+  it("warns but completes when a catch-up move succeeds and claim release fails", async () => {
+    (isMessageClaimed as jest.Mock).mockResolvedValue(true);
+    (releaseMessageClaim as jest.Mock).mockRejectedValueOnce(new Error("claim DELETE down"));
+    const ctx = fakeContext();
+    const warnSink = ctx.warn;
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, ctx);
+
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+    expect(releaseMessageClaim).toHaveBeenCalledTimes(1);
+    expect(warnSink).toHaveBeenCalledWith(
+      expect.stringContaining("Message claim release failed"),
+      expect.anything()
+    );
+  });
+
+  it("keeps a catch-up claim when processed-folder resolution returns 404", async () => {
+    (isMessageClaimed as jest.Mock).mockResolvedValue(true);
+    (ensureMailFolder as jest.Mock).mockImplementation(
+      (_g: any, _mb: any, name: string) =>
+        name === "Reprocess"
+          ? Promise.resolve("reprocess-folder-id")
+          : Promise.reject({ response: { status: 404 } })
+    );
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(getMessage).not.toHaveBeenCalled();
+    expect(releaseMessageClaim).not.toHaveBeenCalled();
+  });
+
+  it("keeps a catch-up claim when move returns 404 but the source message still exists", async () => {
+    (isMessageClaimed as jest.Mock).mockResolvedValue(true);
+    (moveMessageToFolder as jest.Mock).mockRejectedValueOnce({ response: { status: 404 } });
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(getMessage).toHaveBeenCalledTimes(1); // ambiguous move 404 is verified
+    expect(releaseMessageClaim).not.toHaveBeenCalled();
+  });
+
+  it("releases a catch-up claim only when a move 404 is verified by a missing source", async () => {
+    (isMessageClaimed as jest.Mock).mockResolvedValue(true);
+    (moveMessageToFolder as jest.Mock).mockRejectedValueOnce({ response: { status: 404 } });
+    (getMessage as jest.Mock).mockRejectedValueOnce({ response: { status: 404 } });
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(getMessage).toHaveBeenCalledTimes(1);
+    expect(releaseMessageClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it("logs a claim-write failure after ticket work without throwing or moving", async () => {
+    process.env.MAILBOX_DRAIN = "false";
+    (claimMessage as jest.Mock).mockRejectedValueOnce(new Error("claim PUT down"));
+    hdMock.onGet("/tickets").reply(200, []);
+    hdMock.onPost("/tickets").reply(200, { ID: "NEW1" });
+    const ctx = fakeContext();
+    const errorSink = ctx.error;
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, ctx);
+
+    expect(hdMock.history.post).toHaveLength(1);
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(errorSink).toHaveBeenCalledWith(
+      expect.stringContaining("Message claim FAILED"),
+      expect.anything()
+    );
+  });
+
+  it("claims an ignored sender while drain is off without moving or ticketing it", async () => {
+    process.env.MAILBOX_DRAIN = "false";
+    (getMessage as jest.Mock).mockResolvedValue(
+      graphMsg({ from: { emailAddress: { address: "bounce@helpdesk.com" } } })
+    );
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.get).toHaveLength(0);
+    expect(hdMock.history.post).toHaveLength(0);
+    expect(hdMock.history.patch).toHaveLength(0);
+    expect(listMessageAttachments).not.toHaveBeenCalled();
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(claimMessage).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -509,8 +726,11 @@ describe("move-to-processed failure handling (the idempotency linchpin)", () => 
     hdMock.onPatch(/\/tickets\/NEW1/).reply(200, {});
   });
 
-  it("treats a 404 on move as the idempotent outcome: no error log, no rethrow", async () => {
+  it("treats a move 404 as idempotent only after verifying the source is gone", async () => {
     (moveMessageToFolder as jest.Mock).mockRejectedValueOnce({ response: { status: 404 } });
+    (getMessage as jest.Mock)
+      .mockResolvedValueOnce(graphMsg())
+      .mockRejectedValueOnce({ response: { status: 404 } });
     const ctx = fakeContext();
     const errorLog = ctx.error as jest.Mock; // buffered logger forwards to this original fn
 
@@ -518,6 +738,20 @@ describe("move-to-processed failure handling (the idempotency linchpin)", () => 
 
     expect(sendMailViaGraph).not.toHaveBeenCalled(); // new ticket -> no notice
     expect(errorLog).not.toHaveBeenCalled();
+  });
+
+  it("logs a move 404 as a failure when source-message verification still finds the email", async () => {
+    (moveMessageToFolder as jest.Mock).mockRejectedValueOnce({ response: { status: 404 } });
+    const ctx = fakeContext();
+    const errorLog = ctx.error as jest.Mock;
+
+    await expect(processMail({ mailbox: MAILBOX, messageId: "M1" }, ctx)).resolves.toBeUndefined();
+
+    expect(getMessage).toHaveBeenCalledTimes(2); // initial processing + post-move verification
+    expect(errorLog).toHaveBeenCalledWith(
+      expect.stringContaining("source message still exists"),
+      expect.anything()
+    );
   });
 
   it("surfaces a non-404 move failure loudly, without rethrowing", async () => {
@@ -585,16 +819,50 @@ describe("ignore-before cutoff (pre-go-live backlog)", () => {
     hdMock.onPatch(/\/tickets\/NEW1/).reply(200, {});
   });
 
-  it("leaves a pre-cutoff message untouched: no ticket, no ack, NOT moved", async () => {
+  it("never claims or moves a pre-cutoff triggering message across drain-off and drain-on runs", async () => {
+    process.env.MAILBOX_DRAIN = "false";
     (getMessage as jest.Mock).mockResolvedValue(
       graphMsg({ receivedDateTime: "2026-06-19T21:59:59Z" }) // 1s before the 22:00Z cutoff
     );
 
     await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
 
+    expect(hdMock.history.get).toHaveLength(0);
     expect(hdMock.history.post).toHaveLength(0);
+    expect(hdMock.history.patch).toHaveLength(0);
+    expect(listMessageAttachments).not.toHaveBeenCalled();
     expect(sendMailViaGraph).not.toHaveBeenCalled();
-    expect(moveMessageToFolder).not.toHaveBeenCalled(); // left in the inbox
+    expect(claimMessage).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+
+    // Enabling the move switch cannot catch this message up: the first pass deliberately left no
+    // claim, so it is fetched and protected by the cutoff guard again.
+    process.env.MAILBOX_DRAIN = "true";
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(getMessage).toHaveBeenCalledTimes(2);
+    expect(hdMock.history.post).toHaveLength(0);
+    expect(claimMessage).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(releaseMessageClaim).not.toHaveBeenCalled();
+  });
+
+  it("protects pre-cutoff mail in drain-on swallow mode", async () => {
+    process.env.MAILBOX_DRAIN = "true";
+    process.env.TICKET_CREATE = "false";
+    (getMessage as jest.Mock).mockResolvedValue(
+      graphMsg({ receivedDateTime: "2026-06-19T21:59:59Z" })
+    );
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.get).toHaveLength(0);
+    expect(hdMock.history.post).toHaveLength(0);
+    expect(hdMock.history.patch).toHaveLength(0);
+    expect(listMessageAttachments).not.toHaveBeenCalled();
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
+    expect(claimMessage).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
   });
 
   it("processes a message received at/after the cutoff", async () => {
@@ -662,6 +930,27 @@ describe("inbox drain (process all outstanding mail)", () => {
     expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
   });
 
+  it("isolates a claim-read failure, processes siblings, then rethrows without acting blind", async () => {
+    (listInboxMessageIds as jest.Mock).mockResolvedValue(["M1", "M2"]);
+    (isMessageClaimed as jest.Mock).mockImplementation((_client: any, name: string) =>
+      name.endsWith(":M1")
+        ? Promise.reject(new Error("claim HEAD down"))
+        : Promise.resolve(false)
+    );
+    (getMessage as jest.Mock).mockImplementation((_g: any, _mb: any, id: string) =>
+      Promise.resolve(graphMsg({ id, subject: "Second issue" }))
+    );
+
+    await expect(
+      processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext())
+    ).rejects.toThrow(/failed during inbox drain/);
+
+    expect(getMessage).toHaveBeenCalledTimes(1);
+    expect((getMessage as jest.Mock).mock.calls[0][2]).toBe("M2");
+    expect(hdMock.history.post).toHaveLength(1); // sibling still ticketed
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+  });
+
   it("sends the error-only debug email FROM the mailbox the message landed in", async () => {
     process.env.SEND_DEBUG_EMAIL = "true";
     (getMessage as jest.Mock).mockRejectedValue({ response: { status: 500 } });
@@ -696,9 +985,78 @@ describe("inbox drain (process all outstanding mail)", () => {
     expect(call[3]).toBe("2026-06-19T22:00:00.000Z");
   });
 
-  it("re-enqueues a continuation drain when the listing hits the batch cap", async () => {
-    // Default batch size is 10; a full page signals there may be more mail to drain.
+  it("does not re-enqueue when a full listing contains only claimed drain-off messages", async () => {
+    process.env.MAILBOX_DRAIN = "false";
     const ids = Array.from({ length: 10 }, (_, i) => `m${i}`);
+    (listInboxMessageIds as jest.Mock).mockResolvedValue(ids);
+    (isMessageClaimed as jest.Mock).mockResolvedValue(true);
+
+    const ctx = fakeContext();
+    await processMail({ mailbox: MAILBOX, messageId: "m0" }, ctx);
+
+    expect(isMessageClaimed).toHaveBeenCalledTimes(10);
+    expect(getMessage).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(ctx.extraOutputs.set).not.toHaveBeenCalled();
+  });
+
+  it("skips claimed drain-off ids without letting them consume the actionable cap", async () => {
+    process.env.MAILBOX_DRAIN = "false";
+    const ids = Array.from({ length: 11 }, (_, i) => `m${i}`);
+    (listInboxMessageIds as jest.Mock).mockResolvedValue(ids);
+    (isMessageClaimed as jest.Mock).mockImplementation((_client: any, name: string) =>
+      Promise.resolve(!name.endsWith(":m10"))
+    );
+    (getMessage as jest.Mock).mockResolvedValue(
+      graphMsg({ id: "m10", from: { emailAddress: { address: "bounce@helpdesk.com" } } })
+    );
+
+    const ctx = fakeContext();
+    await processMail({ mailbox: MAILBOX, messageId: "m0" }, ctx);
+
+    expect(isMessageClaimed).toHaveBeenCalledTimes(11);
+    expect(getMessage).toHaveBeenCalledTimes(1);
+    expect(claimMessage).toHaveBeenCalledTimes(1);
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+    expect(ctx.extraOutputs.set).not.toHaveBeenCalled();
+  });
+
+  it("counts claimed catch-up moves toward the cap and re-enqueues catch-up overflow", async () => {
+    const ids = Array.from({ length: 11 }, (_, i) => `m${i}`);
+    (listInboxMessageIds as jest.Mock).mockResolvedValue(ids);
+    (isMessageClaimed as jest.Mock).mockResolvedValue(true);
+
+    const ctx = fakeContext();
+    await processMail({ mailbox: MAILBOX, messageId: "m0" }, ctx);
+
+    expect(getMessage).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(10);
+    expect(releaseMessageClaim).toHaveBeenCalledTimes(10);
+    expect(ctx.extraOutputs.set).toHaveBeenCalledTimes(1);
+  });
+
+  it("shares one actionable cap across Inbox and Reprocess", async () => {
+    const inboxIds = Array.from({ length: 6 }, (_, i) => `i${i}`);
+    const reprocessIds = Array.from({ length: 6 }, (_, i) => `r${i}`);
+    (listInboxMessageIds as jest.Mock).mockResolvedValue(inboxIds);
+    (listFolderMessageIds as jest.Mock).mockResolvedValue(reprocessIds);
+    (getMessage as jest.Mock).mockImplementation((_g: any, _mb: any, id: string) =>
+      Promise.resolve(
+        graphMsg({ id, from: { emailAddress: { address: "bounce@helpdesk.com" } } })
+      )
+    );
+
+    const ctx = fakeContext();
+    await processMail({ mailbox: MAILBOX, messageId: "i0" }, ctx);
+
+    expect(getMessage).toHaveBeenCalledTimes(10);
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(10);
+    expect(ctx.extraOutputs.set).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-enqueues when fully paginated results contain unclaimed work beyond the operation cap", async () => {
+    // Default operation cap is 10; the eleventh eligible id proves work remains.
+    const ids = Array.from({ length: 11 }, (_, i) => `m${i}`);
     (listInboxMessageIds as jest.Mock).mockResolvedValue(ids);
     // Make them ignored-sender so they short-circuit (move only) — keeps the test focused on
     // the continuation trigger rather than 10 ticket round-trips.
@@ -710,6 +1068,7 @@ describe("inbox drain (process all outstanding mail)", () => {
     await processMail({ mailbox: MAILBOX, messageId: "m0" }, ctx);
 
     expect(moveMessageToFolder).toHaveBeenCalledTimes(10);
+    expect(getMessage).toHaveBeenCalledTimes(10); // overflow is detected by claim HEAD, not fetched
     expect(ctx.extraOutputs.set).toHaveBeenCalledTimes(1);
     const [, msgs] = (ctx.extraOutputs.set as jest.Mock).mock.calls[0];
     expect(JSON.parse(msgs[0])).toEqual({ mailbox: MAILBOX, messageId: "m0" });
@@ -722,6 +1081,38 @@ describe("reprocess folder (replay as new inbound; cutoff bypass; no customer ac
     hdMock.onPost("/tickets").reply(200, { ID: "NEW1" });
     hdMock.onGet("/tickets/NEW1").reply(200, { shortID: "SHORT1" });
     hdMock.onPatch(/\/tickets\/NEW1/).reply(200, {});
+  });
+
+  it("claims a drain-off replay once, skips it later, then catch-up moves and releases it", async () => {
+    process.env.MAILBOX_DRAIN = "false";
+    (listInboxMessageIds as jest.Mock).mockResolvedValue([]);
+    (listFolderMessageIds as jest.Mock).mockResolvedValue(["R1"]);
+    (getMessage as jest.Mock).mockResolvedValue(graphMsg({ id: "R1" }));
+    (isMessageClaimed as jest.Mock)
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true);
+
+    await processMail({ mailbox: MAILBOX }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(1);
+    expect(getMessage).toHaveBeenCalledTimes(1);
+    expect(claimMessage).toHaveBeenCalledTimes(1);
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+
+    await processMail({ mailbox: MAILBOX }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(1);
+    expect(getMessage).toHaveBeenCalledTimes(1);
+    expect(claimMessage).toHaveBeenCalledTimes(1);
+
+    process.env.MAILBOX_DRAIN = "true";
+    await processMail({ mailbox: MAILBOX }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(1);
+    expect(getMessage).toHaveBeenCalledTimes(1);
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+    expect(releaseMessageClaim).toHaveBeenCalledTimes(1);
   });
 
   it("replays a Reprocess message that predates the ignore-before cutoff, but sends NO ack", async () => {
@@ -800,7 +1191,13 @@ describe("reprocess folder (replay as new inbound; cutoff bypass; no customer ac
     // The drain resolves the Reprocess folder by display name, then lists by that resolved id —
     // proving the reprocess listing isn't accidentally pointed at the inbox/processed folder.
     expect(ensureMailFolder).toHaveBeenCalledWith({ id: "graph" }, MAILBOX, "Reprocess");
-    expect(listFolderMessageIds).toHaveBeenCalledWith({ id: "graph" }, MAILBOX, "reprocess-folder-id", 10);
+    expect(listFolderMessageIds).toHaveBeenCalledWith(
+      { id: "graph" },
+      MAILBOX,
+      "reprocess-folder-id",
+      10,
+      expect.any(Function)
+    );
   });
 
   it("skips a Reprocess message from an ignored loop sender (no ticket) but still moves it out", async () => {
@@ -818,10 +1215,10 @@ describe("reprocess folder (replay as new inbound; cutoff bypass; no customer ac
     expect(moveMessageToFolder).toHaveBeenCalledTimes(1); // moved out of Reprocess -> no re-loop
   });
 
-  it("re-enqueues a continuation drain when the Reprocess folder hits the batch cap", async () => {
-    // Inbox empty, Reprocess full (10 = DRAIN_BATCH_SIZE): the OR-branch must still continue.
+  it("re-enqueues a continuation drain when Reprocess has eligible overflow", async () => {
+    // Inbox empty; Reprocess has 11 eligible messages and the shared invocation cap is 10.
     (listInboxMessageIds as jest.Mock).mockResolvedValue([]);
-    const ids = Array.from({ length: 10 }, (_, i) => `r${i}`);
+    const ids = Array.from({ length: 11 }, (_, i) => `r${i}`);
     (listFolderMessageIds as jest.Mock).mockResolvedValue(ids);
     // Ignored senders short-circuit (move only) — keeps the test on the continuation trigger.
     (getMessage as jest.Mock).mockImplementation((_g: any, _mb: any, id: string) =>

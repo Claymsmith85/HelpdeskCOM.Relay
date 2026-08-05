@@ -14,6 +14,7 @@ import {
   listFolderMessageIds,
   listMessageAttachments,
   fetchAttachmentBytes,
+  MAIL_MESSAGE_LIST_PAGE_BUDGET,
   sendMailViaGraph,
   type GraphMessage,
 } from "./graph-mail";
@@ -158,17 +159,71 @@ describe("listInboxMessageIds", () => {
     );
   });
 
-  it("pages via @odata.nextLink and caps at max", async () => {
+  it("follows @odata.nextLink unchanged and keeps ids oldest-first across pages", async () => {
     mock.onGet(/mailFolders\('inbox'\)/).reply(200, {
       value: [{ id: "a" }, { id: "b" }],
       "@odata.nextLink": "https://graph.microsoft.com/v1.0/page2",
     });
     mock.onGet(/page2/).reply(200, { value: [{ id: "c" }, { id: "d" }] });
 
-    const ids = await listInboxMessageIds(graph, "mb", 3);
+    const ids = await listInboxMessageIds(graph, "mb", 2);
 
-    expect(ids).toEqual(["a", "b", "c"]); // capped at max=3
-    expect(mock.history.get).toHaveLength(2); // both pages fetched
+    expect(ids).toEqual(["a", "b", "c", "d"]);
+    expect(mock.history.get).toHaveLength(2);
+    expect(mock.history.get[0].url).toContain("$top=2");
+    expect(mock.history.get[1].url).toBe("https://graph.microsoft.com/v1.0/page2");
+  });
+
+  it("preserves the received-after filter by following the server-provided nextLink", async () => {
+    const cutoff = "2026-06-19T22:00:00.000Z";
+    const nextLink =
+      "https://graph.microsoft.com/v1.0/users/mb/mailFolders('inbox')/messages" +
+      "?$select=id&$orderby=receivedDateTime%20asc" +
+      `&$filter=receivedDateTime%20ge%20${cutoff}&$skiptoken=opaque`;
+    mock.onGet(/mailFolders\('inbox'\).*\$top=/).reply(200, {
+      value: [{ id: "a" }],
+      "@odata.nextLink": nextLink,
+    });
+    mock.onGet(nextLink).reply(200, { value: [{ id: "b" }] });
+
+    const ids = await listInboxMessageIds(graph, "mb", 2, cutoff);
+
+    expect(ids).toEqual(["a", "b"]);
+    expect(mock.history.get[0].url).toContain(`$filter=receivedDateTime ge ${cutoff}`);
+    expect(mock.history.get[1].url).toBe(nextLink);
+  });
+
+  it("stops at the hard page budget and logs when another page remains", async () => {
+    const log = jest.fn();
+    mock.onGet(/mailFolders\('inbox'\)/).reply(200, {
+      value: [{ id: "id-1" }],
+      "@odata.nextLink": "https://graph.microsoft.com/v1.0/page?number=2",
+    });
+    mock.onGet(/\/page\?number=/).reply((config) => {
+      const page = Number(new URL(config.url ?? "").searchParams.get("number"));
+      return [
+        200,
+        {
+          value: [{ id: `id-${page}` }],
+          "@odata.nextLink": `https://graph.microsoft.com/v1.0/page?number=${page + 1}`,
+        },
+      ];
+    });
+
+    const ids = await listInboxMessageIds(graph, "mb", 1, undefined, log);
+
+    expect(ids).toEqual(
+      Array.from({ length: MAIL_MESSAGE_LIST_PAGE_BUDGET }, (_, i) => `id-${i + 1}`)
+    );
+    expect(mock.history.get).toHaveLength(MAIL_MESSAGE_LIST_PAGE_BUDGET);
+    expect(mock.history.get.some((request) => request.url?.includes("number=11"))).toBe(false);
+    expect(log).toHaveBeenCalledWith("Graph mail listing truncated at page budget", {
+      mailbox: "mb",
+      folderResource: "mailFolders('inbox')",
+      pageBudget: MAIL_MESSAGE_LIST_PAGE_BUDGET,
+      pageSize: 1,
+      ids: MAIL_MESSAGE_LIST_PAGE_BUDGET,
+    });
   });
 });
 
@@ -195,16 +250,16 @@ describe("listFolderMessageIds", () => {
     expect(url).not.toContain("$filter"); // reprocess intentionally bypasses the ignore-before cutoff
   });
 
-  it("pages via @odata.nextLink and caps at max", async () => {
+  it("pages beyond the page-size hint so callers can filter the complete listing", async () => {
     mock.onGet(/mailFolders\/FID/).reply(200, {
       value: [{ id: "a" }, { id: "b" }],
       "@odata.nextLink": "https://graph.microsoft.com/v1.0/page2",
     });
     mock.onGet(/page2/).reply(200, { value: [{ id: "c" }, { id: "d" }] });
 
-    const ids = await listFolderMessageIds(graph, "mb", "FID", 3);
+    const ids = await listFolderMessageIds(graph, "mb", "FID", 2);
 
-    expect(ids).toEqual(["a", "b", "c"]); // capped at max=3
+    expect(ids).toEqual(["a", "b", "c", "d"]);
     expect(mock.history.get).toHaveLength(2);
   });
 });

@@ -8,9 +8,9 @@
 // MAIL_SWEEP_CRON regardless of notification delivery, and on every restart (runOnStartup) so a
 // reboot immediately catches up on whatever arrived while the app was down.
 //
-// Cheap + idempotent by construction: the heavy lifting and the move-to-processed idempotency live
-// in process-mail, so when notifications are healthy the inbox is already drained and each sweep is
-// just a light id-only listing per mailbox that finds nothing.
+// Idempotency lives in process-mail: handled mail is either moved to processed (drain on) or left in
+// place behind a storage claim (drain off). In drain-off mode a sweep still pays the bounded id-only
+// listing + claim-HEAD cost, but it does not repeat ticket or acknowledgement side effects.
 import { app, InvocationContext, Timer } from "@azure/functions";
 import { mailboxList } from "./subscriptions";
 import { createStepLogger } from "./logging";
@@ -32,7 +32,7 @@ export async function sweepInbox(
   }
 
   // A sweep item carries only the mailbox (no specific messageId): process-mail treats it as
-  // "drain this mailbox's whole inbox".
+  // "scan this mailbox for bounded outstanding/claimed work".
   const items = mailboxes.map((mailbox): string =>
     JSON.stringify({ mailbox } satisfies MailQueueItem)
   );

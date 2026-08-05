@@ -250,6 +250,11 @@ jobs:
                 "value": "${{ vars.MAILBOX_DRAIN }}"
               },
               {
+                "name": "MAIL_IGNORE_BEFORE",
+                "slotSetting": false,
+                "value": "${{ vars.MAIL_IGNORE_BEFORE }}"
+              },
+              {
                 "name": "TICKET_CREATE",
                 "slotSetting": false,
                 "value": "${{ vars.TICKET_CREATE }}"

@@ -1,5 +1,11 @@
 # Toggle Refactor Plan — Five Independent Feature Switches
 
+> **Amended by [`mailbox-drain-decouple-plan.md`](mailbox-drain-decouple-plan.md).** The five-toggle
+> split remains in force, but `MAILBOX_DRAIN` now controls only the move-to-processed finalization.
+> With drain off and `TICKET_CREATE` on, inbound ticketing still runs and create-once storage claims
+> make the unmoved messages idempotent. Any drain semantics below are historical implementation
+> context and are superseded by the newer plan.
+
 Handoff plan for implementing granular feature toggles in the CoreSpecialty Mail → Helpdesk relay.
 Read `CLAUDE.md` first — it documents the architecture and the cross-file invariants (echo
 suppression, loop guards, idempotency) that every change below must preserve.

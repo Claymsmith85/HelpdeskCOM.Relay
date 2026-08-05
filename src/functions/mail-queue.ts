@@ -13,7 +13,7 @@ export const MAIL_QUEUE_NAME = process.env.MAIL_QUEUE_NAME ?? "mail-notification
 export const MAIL_QUEUE_POISON_NAME = `${MAIL_QUEUE_NAME}-poison`;
 
 // messageId is optional: the `notify` path always sets it (the changed message), but a sweep item
-// (sweep-inbox.ts) carries only a mailbox and means "drain this mailbox's whole inbox".
+// (sweep-inbox.ts) carries only a mailbox and means "scan this mailbox for bounded work".
 export type MailQueueItem = { mailbox: string; messageId?: string };
 
 /**
