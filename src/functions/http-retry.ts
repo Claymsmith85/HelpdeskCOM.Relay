@@ -1,5 +1,5 @@
 // src/functions/http-retry.ts
-// Shared axios retry policy for the Graph + Helpdesk clients. Graph throttles aggressively
+// Shared axios retry policy for the Graph + Helpdesk + Storage clients. Graph throttles aggressively
 // (429 + Retry-After) and any HTTP boundary can return a transient 503 or drop the connection.
 // Without this, a single such blip throws straight out of the pipeline and lands the bounded mailbox
 // scan on the queue's coarse retry (which re-lists/rechecks work and ignores Retry-After). This
@@ -19,6 +19,8 @@ export type RetryOptions = {
   maxRetries?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
+  // Stable boundary name carried into terminal error logs (e.g. Helpdesk, Microsoft Graph).
+  apiName?: string;
   // Injectable for tests so retries don't actually wait on a real timer.
   sleep?: (ms: number) => Promise<void>;
 };
@@ -34,6 +36,7 @@ const IDEMPOTENT_METHODS = new Set(["get", "head", "options"]);
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 type RetryConfig = AxiosRequestConfig & { __retryCount?: number };
+type LabeledAxiosError = AxiosError & { api?: string; retries?: number };
 
 /**
  * Attach a response-error retry interceptor to an axios instance (returns the same instance).
@@ -45,10 +48,18 @@ export function attachRetryInterceptor(
   const maxRetries = opts.maxRetries ?? DEFAULTS.maxRetries;
   const baseDelayMs = opts.baseDelayMs ?? DEFAULTS.baseDelayMs;
   const maxDelayMs = opts.maxDelayMs ?? DEFAULTS.maxDelayMs;
+  const apiName = opts.apiName;
   const sleep = opts.sleep ?? defaultSleep;
 
   client.interceptors.response.use(undefined, async (error: AxiosError) => {
     const config = error.config as RetryConfig | undefined;
+    const labeled = error as LabeledAxiosError;
+    if (apiName) {
+      labeled.api = apiName;
+      const prefix = `[${apiName} API]`;
+      if (!labeled.message.startsWith(prefix)) labeled.message = `${prefix} ${labeled.message}`;
+    }
+    labeled.retries = config?.__retryCount ?? 0;
     if (!config) throw error;
 
     const attempt = config.__retryCount ?? 0;

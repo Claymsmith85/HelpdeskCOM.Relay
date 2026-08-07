@@ -4,7 +4,42 @@
 
 import axios from "axios";
 import MockAdapter from "axios-mock-adapter";
-import { findTicketByShortId } from "./helpdesk-client";
+import { createHelpdeskClient, findTicketByShortId } from "./helpdesk-client";
+import { formatAxiosError } from "./logging";
+
+describe("createHelpdeskClient wiring", () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+    delete process.env.HELPDESK_PAT;
+    delete process.env.HELPDESK_RATE_LIMIT_RPS;
+  });
+
+  it("attaches its interceptors only once when axios.create returns a shared instance", async () => {
+    process.env.HELPDESK_PAT = "pat-token";
+    process.env.HELPDESK_RATE_LIMIT_RPS = "100000";
+    const shared = axios.create();
+    const mock = new MockAdapter(shared);
+    jest.spyOn(axios, "create").mockReturnValue(shared);
+
+    expect(createHelpdeskClient()).toBe(shared);
+    expect(createHelpdeskClient()).toBe(shared);
+    expect((shared.interceptors.request as any).handlers).toHaveLength(1);
+    expect((shared.interceptors.response as any).handlers).toHaveLength(1);
+
+    mock.onGet("/x").reply(200, { ok: true });
+    await expect(shared.get("/x")).resolves.toMatchObject({ data: { ok: true } });
+
+    mock.onGet("/failure").reply(404);
+    const error = await shared.get("/failure").catch((e) => e);
+    expect(formatAxiosError(error)).toMatchObject({
+      api: "Helpdesk",
+      retries: 0,
+      status: 404,
+      message: expect.stringContaining("[Helpdesk API]"),
+    });
+    mock.restore();
+  });
+});
 
 describe("findTicketByShortId", () => {
   const client = axios.create({ baseURL: "https://hd.example" });

@@ -71,7 +71,7 @@ export async function createGraphClient(
       "Content-Type": "application/json",
     },
   });
-  return attachRetryInterceptor(client);
+  return attachRetryInterceptor(client, { apiName: "Microsoft Graph" });
 }
 
 /**

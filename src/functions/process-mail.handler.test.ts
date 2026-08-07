@@ -127,6 +127,10 @@ function fakeContext() {
 
 beforeEach(() => {
   process.env.HELPDESK_PAT = "pat-token";
+  // Avoid pacing sleeps and keep the suite's real-backoff case on its legacy retry ladder.
+  process.env.HELPDESK_RATE_LIMIT_RPS = "100000";
+  process.env.HELPDESK_RETRY_MAX_RETRIES = "3";
+  process.env.HELPDESK_RETRY_MAX_DELAY_MS = "20000";
   // Every new switch is default OFF. Most workflow tests exercise the fully-enabled inbound path;
   // the independent disabled combinations are covered in their own cases below.
   process.env.MAILBOX_DRAIN = "true";
@@ -161,6 +165,9 @@ afterEach(() => {
   hdMock.restore();
   createSpy.mockRestore();
   delete process.env.HELPDESK_PAT;
+  delete process.env.HELPDESK_RATE_LIMIT_RPS;
+  delete process.env.HELPDESK_RETRY_MAX_RETRIES;
+  delete process.env.HELPDESK_RETRY_MAX_DELAY_MS;
   delete process.env.MAILBOX_DRAIN;
   delete process.env.TICKET_CREATE;
   delete process.env.SUBMITTER_REPLIES;

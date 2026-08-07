@@ -7,12 +7,19 @@ import { ListTicketsResponse } from "../types/ListTicketsResponse";
 import { extractTicketRef, normalizeRef } from "./subject";
 import { attachRetryInterceptor } from "./http-retry";
 import { envPositiveNumber, requireEnv } from "./env";
+import { attachRateLimitInterceptor, createRateLimiter } from "./rate-limit";
 
 const HELP_DESK_BASE_URL =
   process.env.HELPDESK_BASE_URL ?? "https://api.helpdesk.com/v1";
 
 // Per-request timeout so a hung Helpdesk call fails fast instead of stalling the whole drain.
 const HELPDESK_TIMEOUT_MS = envPositiveNumber(process.env.HELPDESK_HTTP_TIMEOUT_MS, 60_000);
+
+const DEFAULT_HELPDESK_RATE_LIMIT_RPS = 5;
+const DEFAULT_HELPDESK_RETRY_MAX_RETRIES = 5;
+const DEFAULT_HELPDESK_RETRY_MAX_DELAY_MS = 60_000;
+const helpdeskLimiter = createRateLimiter();
+const HELPDESK_CLIENT_WIRED = Symbol("helpdesk-client interceptors attached");
 
 export type TicketSummary = Pick<ListTicketsResponse, "ID" | "shortID" | "subject">;
 
@@ -30,7 +37,27 @@ export function createHelpdeskClient(): AxiosInstance {
       "User-Agent": "cs-azurefn-email/1.0 (+https://corespecialty.com)",
     },
   });
-  return attachRetryInterceptor(client);
+  if ((client as any)[HELPDESK_CLIENT_WIRED]) return client;
+  (client as any)[HELPDESK_CLIENT_WIRED] = true;
+
+  const rps = envPositiveNumber(
+    process.env.HELPDESK_RATE_LIMIT_RPS,
+    DEFAULT_HELPDESK_RATE_LIMIT_RPS
+  );
+  const intervalMs = rps > 1000 ? 0 : Math.ceil(1000 / rps);
+  attachRateLimitInterceptor(client, helpdeskLimiter, intervalMs);
+  return attachRetryInterceptor(client, {
+    apiName: "Helpdesk",
+    maxRetries: envPositiveNumber(
+      process.env.HELPDESK_RETRY_MAX_RETRIES,
+      DEFAULT_HELPDESK_RETRY_MAX_RETRIES,
+      { integer: true }
+    ),
+    maxDelayMs: envPositiveNumber(
+      process.env.HELPDESK_RETRY_MAX_DELAY_MS,
+      DEFAULT_HELPDESK_RETRY_MAX_DELAY_MS
+    ),
+  });
 }
 
 /**

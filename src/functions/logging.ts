@@ -41,6 +41,8 @@ function formatResponseData(data: unknown): string | undefined {
 export function formatAxiosError(e: any): any {
   const ax = e as AxiosError;
   return {
+    api: (ax as any)?.api,
+    retries: (ax as any)?.retries,
     message: ax?.message ?? String(e),
     name: ax?.name,
     code: (ax as any)?.code,

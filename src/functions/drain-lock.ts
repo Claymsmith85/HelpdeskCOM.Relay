@@ -288,9 +288,13 @@ async function buildStorageClient(): Promise<AxiosInstance> {
   });
 }
 
-function errInfo(e: unknown): { status?: number; message: string } {
+function errInfo(e: unknown): { api?: string; status?: number; message: string } {
   const ax = e as AxiosError;
-  return { status: ax?.response?.status, message: ax?.message ?? String(e) };
+  return {
+    api: (ax as any)?.api,
+    status: ax?.response?.status,
+    message: ax?.message ?? String(e),
+  };
 }
 
 // #endregion

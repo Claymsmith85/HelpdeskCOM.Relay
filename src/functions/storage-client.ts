@@ -191,5 +191,5 @@ export async function buildStorageClient(opts: StorageClientOptions): Promise<Ax
     cfg.headers.set("x-ms-date", new Date().toUTCString());
     return cfg;
   });
-  return attachRetryInterceptor(client);
+  return attachRetryInterceptor(client, { apiName: "Azure Blob Storage" });
 }

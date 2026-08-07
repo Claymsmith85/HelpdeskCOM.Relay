@@ -6,6 +6,7 @@
 import axios, { AxiosError, AxiosInstance } from "axios";
 import MockAdapter from "axios-mock-adapter";
 import { attachRetryInterceptor, isRetryable, parseRetryAfter } from "./http-retry";
+import { formatAxiosError } from "./logging";
 
 // No-op sleep that records the requested delays so backoff/Retry-After can be asserted.
 function recordingSleep() {
@@ -103,19 +104,31 @@ describe("attachRetryInterceptor (end to end)", () => {
     expect(mock.history.post).toHaveLength(1);
   });
 
-  it("does NOT retry a 404", async () => {
-    const { instance, mock } = client();
+  it("does NOT retry a 404 and labels the failing API", async () => {
+    const { instance, mock } = client({ apiName: "Microsoft Graph" });
     mock.onGet("/x").reply(404);
 
-    await expect(instance.get("/x")).rejects.toBeTruthy();
+    const error = await instance.get("/x").catch((e) => e);
+    expect(formatAxiosError(error)).toMatchObject({
+      api: "Microsoft Graph",
+      retries: 0,
+      status: 404,
+      message: expect.stringContaining("[Microsoft Graph API]"),
+    });
     expect(mock.history.get).toHaveLength(1);
   });
 
-  it("gives up after maxRetries on a persistent 429", async () => {
-    const { instance, mock } = client({ maxRetries: 3 });
+  it("gives up after maxRetries and reports the API plus retry count", async () => {
+    const { instance, mock } = client({ apiName: "Helpdesk", maxRetries: 3 });
     mock.onGet("/x").reply(429);
 
-    await expect(instance.get("/x")).rejects.toBeTruthy();
+    const error = await instance.get("/x").catch((e) => e);
+    expect(formatAxiosError(error)).toMatchObject({
+      api: "Helpdesk",
+      retries: 3,
+      status: 429,
+      message: expect.stringContaining("[Helpdesk API]"),
+    });
     expect(mock.history.get).toHaveLength(4); // initial + 3 retries
   });
 
@@ -127,5 +140,15 @@ describe("attachRetryInterceptor (end to end)", () => {
 
     await instance.get("/x");
     expect(delays).toEqual([2000]);
+  });
+
+  it("uses a configured max delay to lift the Retry-After clamp", async () => {
+    const { delays, sleep } = recordingSleep();
+    const { instance, mock } = client({ maxDelayMs: 60_000, sleep });
+    mock.onGet("/x").replyOnce(429, undefined, { "retry-after": "45" });
+    mock.onGet("/x").replyOnce(200, {});
+
+    await instance.get("/x");
+    expect(delays).toEqual([45_000]);
   });
 });

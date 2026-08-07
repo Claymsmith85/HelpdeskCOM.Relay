@@ -30,12 +30,14 @@ src/
     helpdesk.ts            # HTTP fn: Helpdesk webhook -> requester, assigned-agent, follower/cc mail
     renew-subscriptions.ts # Timer fn: create/renew Graph mailbox subscriptions (runOnStartup)
     sweep-inbox.ts         # Timer fn: safety-net — enqueue a drain per mailbox (runOnStartup)
+    clear-mail-queue.ts     # App-start hook: optionally clear stale primary queue messages
     mail-poison.ts         # Queue fn: log dead-lettered drains at error severity (alertable)
     graph-client.ts        # Shared app-only Graph token + axios client (timeouts + retry)
     http-retry.ts          # Shared axios retry policy (429/503 + idempotent-only 5xx)
     graph-mail.ts          # Graph mail I/O (read message/attachments, sendMail, move, builders)
     sharepoint.ts          # Graph upload helpers (site/drive/folder; content PUT or chunked session)
     helpdesk-client.ts     # Helpdesk REST client + ticket operations
+    rate-limit.ts          # Process-local fixed-interval Helpdesk request pacing
     routing.ts             # Inbox -> team routing + inbound loop guard
     logging.ts             # Shared step / buffered loggers
     subscriptions.ts       # Graph subscription create/renew
@@ -173,8 +175,9 @@ Upload mechanics:
 - Files ≤ 10 MiB upload with a single content `PUT`; larger files use a Graph **upload session** written in ≤ 10 MiB fragments (Graph rejects fragments over 60 MiB, so big files must be chunked).
 - Uploads are per-file: one attachment failing to fetch/upload (e.g. a non-file attachment that 404s on `/$value`) is logged and skipped; its siblings still upload.
 - `host.json` tunes the queue so large transfers don't exhaust memory or time out: `functionTimeout` is 10 min and `visibilityTimeout` is set **higher** (15 min) so a slow drain can't have its queue message re-picked by a second worker mid-run and double-process. `batchSize: 1` serializes drains within an instance — both to bound memory (each in-flight message buffers its largest attachment whole, so peak heap ≈ one max-file) and to close the concurrent-duplicate-ticket window. To close that window **across** instances, cap scale-out to a single instance (see the deployment note below); the relay is low-volume, so serial drains are fine. True Graph→SharePoint streaming would remove the memory ceiling if higher concurrency is ever needed.
-- **HTTP resilience.** The Graph and Helpdesk axios clients carry a per-request timeout (`GRAPH_HTTP_TIMEOUT_MS` / `HELPDESK_HTTP_TIMEOUT_MS`, default 60 s; attachment transfers use `GRAPH_TRANSFER_TIMEOUT_MS`, default 300 s) so one hung call can't burn the whole invocation, plus a shared retry policy that honors `Retry-After`. Retry safety: `429`/`503` (server rejected before processing) retry for any method; ambiguous `5xx`/transport errors retry **only** for idempotent reads, so a retry never duplicates a ticket or an outbound email.
+- **HTTP resilience.** The Graph and Helpdesk axios clients carry a per-request timeout (`GRAPH_HTTP_TIMEOUT_MS` / `HELPDESK_HTTP_TIMEOUT_MS`, default 60 s; attachment transfers use `GRAPH_TRANSFER_TIMEOUT_MS`, default 300 s) so one hung call can't burn the whole invocation, plus a shared retry policy that honors `Retry-After`. Retry safety: `429`/`503` (server rejected before processing) retry for any method; ambiguous `5xx`/transport errors retry **only** for idempotent reads, so a retry never duplicates a ticket or an outbound email. Helpdesk calls are additionally paced at 5 requests/second per Function worker process by default, including retries, and use a Helpdesk-scoped retry ladder of 5 retries with a 60 s maximum delay. The Graph and Storage clients keep the shared retry defaults. Terminal HTTP errors carry an explicit `api` (`Helpdesk`, `Microsoft Graph`, `Azure Blob Storage`, or `Azure Queue Storage`) and completed retry count in structured logs, and the API name prefixes the error message for unstructured/runtime logs.
 - **Self-healing + observability.** `sweep-inbox` (timer, default 15 min, `runOnStartup`) enqueues a drain per mailbox regardless of notification delivery, so mail stranded by a delivery outage is always picked up; `renew-subscriptions` is also `runOnStartup` and per-mailbox isolated. Drains that exhaust `maxDequeueCount` dead-letter to `<queue>-poison`, where the `mail-poison` trigger logs them at error severity (queryable/alertable via `traces | where severityLevel >= 3`).
+- **Operator-only startup queue cleanup.** `MAIL_QUEUE_CLEAR_ON_STARTUP` defaults to off. When enabled, each Function worker instance clears only `MAIL_QUEUE_NAME` during startup; `<queue>-poison` is preserved. The startup inbox sweep then enqueues fresh mailbox drains, so the queue is reconstructed from current mailbox state. Because app-start hooks run once per instance (including restarts and scale-out), leaving this enabled can delete newly queued work: reset the live app setting to `false` immediately after one verified cleanup (or reset the GitHub variable and redeploy). The clear is one bounded attempt so it stays inside the language-worker startup budget; a timeout fails startup and the next worker start safely tries the idempotent clear again while the switch remains enabled. Other failures also abort startup rather than consuming the stale queue; disabling the switch is the recovery path. Startup messages are app-level `console` logs rather than function-invocation logs. The identity selected by `AzureWebJobsStorage__clientId` (falling back to `MANAGED_IDENTITY_CLIENT_ID`) needs **Storage Queue Data Contributor** on the storage account.
 - **Scale-out cap (deployment).** Set the Function App to a single instance so cross-instance drains can't race: `az functionapp update -g <rg> -n <app> --set functionAppScaleLimit=1` (or app setting `WEBSITE_MAX_DYNAMIC_APPLICATION_SCALE_OUT=1`). Timers are already singletons; the queue + sweep keep throughput fine at one instance.
 
 ---
@@ -284,6 +287,7 @@ For each, `true`/`on`/`1`/`yes` (case-insensitive) means ON; unset, empty, or an
 | `MAIL_PROCESSED_FOLDER` | Folder handled mail is moved to (default `HelpdeskProcessed`). |
 | `MAIL_REPROCESS_FOLDER` | Folder scanned whenever drain or ticket creation is active (default `Reprocess`, created on demand). Replays each message individually, bypasses `MAIL_IGNORE_BEFORE`, and sends no requester ack. Drain off + ticketing on leaves a handled replay in this folder with a claim; later drain-on catch-up moves it without repeating ticket work. |
 | `MAIL_QUEUE_NAME` | Storage queue name (default `mail-notifications`). |
+| `MAIL_QUEUE_CLEAR_ON_STARTUP` | **Operator recovery switch; default OFF.** When enabled, every worker-instance startup clears only `MAIL_QUEUE_NAME` (never `<queue>-poison`) before normal processing. Set the live app setting back to `false` immediately after the stale backlog is cleared (or reset the GitHub variable and redeploy); `sweep-inbox` reseeds fresh mailbox drains on startup. A clear failure aborts startup. Requires **Storage Queue Data Contributor** for the identity selected by `AzureWebJobsStorage__clientId` (falling back to `MANAGED_IDENTITY_CLIENT_ID`). |
 | `MAIL_DRAIN_BATCH_SIZE` | Max actionable messages handled across Inbox + Reprocess per `process-mail` invocation (default `10`). Listings follow up to 10 Graph pages and skip claimed mail before applying this cap; a continuation is queued only when eligible work remains within that bounded scan. Page-budget truncation is logged. |
 | `MAIL_CLAIM_CONTAINER` | Blob container for drain-off per-message idempotency claims (default `relay-state`). Uses the `AzureWebJobsStorage` account and UAMI; no additional RBAC beyond the existing Blob Data Contributor access. |
 | `MAIL_IGNORE_BEFORE` | Cutoff instant — earlier inbox mail is excluded from listings; a triggering id may be fetched only to apply the cutoff guard, after which it is never ticketed, acknowledged, claimed, or moved. Default/fallback `2026-06-19T22:00:00Z`; missing, empty, or unparseable values keep that default. Use an ISO-8601 UTC value such as `2026-09-01T13:00:00Z`. This deploy-managed variable must be set **per GitHub environment** (`Production` and `Development` need independent values), never as one shared repository value. Set Production to the actual go-live instant before enabling drain/ticketing there. Read once at module load, so a settings change/redeploy restart applies it rather than a hot per-invocation flip. |
@@ -291,6 +295,9 @@ For each, `true`/`on`/`1`/`yes` (case-insensitive) means ON; unset, empty, or an
 | `GRAPH_HTTP_TIMEOUT_MS` | Per-request timeout for normal Graph calls (default `60000`). |
 | `GRAPH_TRANSFER_TIMEOUT_MS` | Per-request timeout for attachment download/upload transfers (default `300000`). |
 | `HELPDESK_HTTP_TIMEOUT_MS` | Per-request timeout for Helpdesk calls (default `60000`). |
+| `HELPDESK_RATE_LIMIT_RPS` | Helpdesk dispatch rate per Function worker process (default `5` requests/second). This is not coordinated across processes or instances and applies to retries too; values above `1000` disable pacing. |
+| `HELPDESK_RETRY_MAX_RETRIES` | Maximum Helpdesk retries after the initial attempt (default `5`). |
+| `HELPDESK_RETRY_MAX_DELAY_MS` | Maximum Helpdesk retry delay, including the `Retry-After` clamp (default `60000`). |
 | `SPO_SITE_URL` | Full SharePoint site URL. |
 | `SPO_LIBRARY_NAME` | Target document library name. |
 | `HELPDESK_PAT` | Helpdesk Personal Access Token (Key Vault reference). |
@@ -322,7 +329,7 @@ Key Vault-linked: `GRAPH_SUBSCRIPTION_CLIENT_STATE`, `HELPDESK_PAT` (resolved by
 
 > **Webhook double-send caution:** because dev and prod both receive the shared Helpdesk account's webhooks, each webhook-driven toggle (`SUBMITTER_REPLIES`, `AGENT_NOTICES`, `FOLLOWERS_NOTICES`) must be on in at most one environment at a time.
 
-`Deploy.yml` maps non-secret app settings from matching GitHub `vars.*` names. This repository currently has no GitHub environments/variables configured, so the live toggles are managed directly as Function App portal settings. After any deploy, re-verify all five values on the target app (or configure matching GitHub variables before deploying). `MAIL_IGNORE_BEFORE` is also deploy-managed now, but unlike the toggles it must be an **environment-scoped** variable: Development and Production require independent cutoffs, and a future Production go-live value applied to Development would silently exclude current test mail.
+`Deploy.yml` maps non-secret app settings from matching GitHub `vars.*` names. This repository currently has no GitHub environments/variables configured, so the live toggles are managed directly as Function App portal settings. After any deploy, re-verify all five values on the target app (or configure matching GitHub variables before deploying). `MAIL_IGNORE_BEFORE` is also deploy-managed now, but unlike the toggles it must be an **environment-scoped** variable: Development and Production require independent cutoffs, and a future Production go-live value applied to Development would silently exclude current test mail. `MAIL_QUEUE_CLEAR_ON_STARTUP` is deploy-mapped as well; scope it to only the environment being cleaned and reset it to `false` after the first verified purge so later restarts cannot discard fresh queue work.
 
 ---
 
@@ -354,6 +361,8 @@ npm run test:coverage
 |-----------|-------|
 | `subject.test.ts` | `[#shortID]` tag extraction / strip-and-append / normalization |
 | `routing.test.ts` | inbox normalization, team routing, inbound loop guard |
+| `rate-limit.test.ts` | fixed-interval slot reservation, concurrency, interceptor pacing, and retry re-entry |
+| `clear-mail-queue.test.ts` | startup purge gate, primary-queue targeting, storage identity configuration, and failure logging |
 | `helpdesk-client.test.ts` | `findTicketByShortId`: shortID param + client-side verification, 4xx→null / 5xx→throw |
 | `templates.test.ts` | auto-reply / agent-reply / notice email builders, relayed-from marker round-trip |
 | `ticket-notices.test.ts` | follower/cc + assigned-agent audiences: visibility, include-own agent replies, echo control, shared lookup, dedupe, isolation |

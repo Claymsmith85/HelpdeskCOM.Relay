@@ -225,6 +225,11 @@ jobs:
                 "value": "${{ vars.MAIL_QUEUE_NAME }}"
               },
               {
+                "name": "MAIL_QUEUE_CLEAR_ON_STARTUP",
+                "slotSetting": false,
+                "value": "${{ vars.MAIL_QUEUE_CLEAR_ON_STARTUP }}"
+              },
+              {
                 "name": "DEBUG_EMAIL_TO",
                 "slotSetting": false,
                 "value": "${{ vars.DEBUG_EMAIL_TO }}"
@@ -278,6 +283,21 @@ jobs:
                 "name": "USERMGMT_TOGGLE",
                 "slotSetting": false,
                 "value": "${{ vars.USERMGMT_TOGGLE }}"
+              },
+              {
+                "name": "HELPDESK_RATE_LIMIT_RPS",
+                "slotSetting": false,
+                "value": "${{ vars.HELPDESK_RATE_LIMIT_RPS }}"
+              },
+              {
+                "name": "HELPDESK_RETRY_MAX_RETRIES",
+                "slotSetting": false,
+                "value": "${{ vars.HELPDESK_RETRY_MAX_RETRIES }}"
+              },
+              {
+                "name": "HELPDESK_RETRY_MAX_DELAY_MS",
+                "slotSetting": false,
+                "value": "${{ vars.HELPDESK_RETRY_MAX_DELAY_MS }}"
               },
                             {
                 "name": "TEAM_SYNC_CRON",
