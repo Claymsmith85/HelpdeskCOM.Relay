@@ -69,6 +69,7 @@ import {
   findTicketByShortId,
   type TicketSummary,
 } from "./helpdesk-client";
+import { extractEscapePortalRequester } from "./escape-portal";
 import { extractTicketRef, normalizeRef } from "./subject";
 import { normalizeInbox, normalizeMailboxKey, routeTeam, shouldIgnoreSender, shouldSuppressRecipient } from "./routing";
 import {
@@ -531,11 +532,30 @@ async function processSingleMessage(
     blocked: plan.blocked.length,
   });
 
+  // Escape Portal submission: a web form relayed by the portal arrives FROM the drain mailbox
+  // itself (from == to), so parsed.fromAddress would make the mailbox the requester — and every
+  // outbound reply to it is loop-suppressed, leaving the real submitter unreachable. When the
+  // surgical detection matches (see escape-portal.ts), the body's "Email ID:" address becomes the
+  // effective requester for lookup, create, ack, and the attachment folder name; any detection
+  // miss (including a portal template with no usable Email ID) leaves everything below exactly
+  // as before.
+  const portalRequester = extractEscapePortalRequester(parsed);
+  if (portalRequester) {
+    step("Escape Portal: submitter extracted as effective requester", {
+      requester: portalRequester.email,
+      name: portalRequester.name,
+    });
+  }
+  const requesterEmail = portalRequester?.email ?? parsed.fromAddress;
+  const requesterName = portalRequester
+    ? portalRequester.name ?? portalRequester.email
+    : parsed.fromName ?? parsed.fromAddress;
+
   step("Helpdesk: listTicketsByRequester begin");
-  const tickets = await listTicketsByRequester(helpdesk, parsed.fromAddress);
+  const tickets = await listTicketsByRequester(helpdesk, requesterEmail);
   let existingTicket: TicketSummary | null = findExistingTicket(parsed.subject, tickets);
   step("Helpdesk: ticket lookup", {
-    requester: parsed.fromAddress,
+    requester: requesterEmail,
     count: tickets.length,
     found: !!existingTicket,
     ticketId: existingTicket?.ID ?? null,
@@ -614,12 +634,16 @@ async function processSingleMessage(
       blocked: plan.blocked,
       suppressAckReason,
       relayedFrom,
+      requesterEmail,
+      // A portal mail's Reply-To (when present) is the drain mailbox itself — the extracted
+      // submitter must win or the ack is loop-suppressed and nobody is acknowledged.
+      ackTo: portalRequester ? requesterEmail : parsed.replyTo ?? parsed.fromAddress,
       step,
       stepError,
     });
   } else {
     await handleNewTicket({
-      helpdesk, parsed, teamId, normalizedInbox,
+      helpdesk, parsed, teamId, normalizedInbox, requesterEmail, requesterName,
       uploadItems, blocked: plan.blocked, step, stepError,
     });
   }
@@ -671,6 +695,10 @@ async function handleExistingTicket(opts: {
   suppressAckReason?: string;
   /** Set when a NON-requester's tagged reply was threaded in — prefixes the relayed-from marker. */
   relayedFrom?: string;
+  /** Effective requester (the Escape Portal submitter when detected, else the sender). */
+  requesterEmail: string;
+  /** Ack recipient — replyTo/sender normally, the extracted submitter for a portal mail. */
+  ackTo: string;
   step: StepFn;
   stepError: StepErrorFn;
 }): Promise<void> {
@@ -684,12 +712,14 @@ async function handleExistingTicket(opts: {
     blocked,
     suppressAckReason,
     relayedFrom,
+    requesterEmail,
+    ackTo,
     step,
     stepError,
   } = opts;
 
   const { folderWebUrl, uploadedLinks } = await uploadToTicket({
-    helpdesk, ticketId: existingTicket.ID, fromAddress: parsed.fromAddress, uploadItems, step, stepError,
+    helpdesk, ticketId: existingTicket.ID, fromAddress: requesterEmail, uploadItems, step, stepError,
   });
 
   // The marker line attributes a threaded non-requester reply in the Helpdesk UI (the API author
@@ -715,7 +745,7 @@ async function handleExistingTicket(opts: {
     });
     await sendAckEmail({
       graph, mailbox,
-      to: parsed.replyTo ?? parsed.fromAddress,
+      to: ackTo,
       subject: ack.subject,
       body: ack.body,
       step, stepError,
@@ -732,26 +762,29 @@ async function handleNewTicket(opts: {
   parsed: InboundMessage;
   teamId: string;
   normalizedInbox: string;
+  /** Effective requester (the Escape Portal submitter when detected, else the sender). */
+  requesterEmail: string;
+  requesterName: string;
   uploadItems: SharePointUploadItem[];
   blocked: AttachmentMeta[];
   step: StepFn;
   stepError: StepErrorFn;
 }): Promise<void> {
   const {
-    helpdesk, parsed, teamId, normalizedInbox,
+    helpdesk, parsed, teamId, normalizedInbox, requesterEmail, requesterName,
     uploadItems, blocked, step, stepError,
   } = opts;
 
   const createdTicketId = await createTicket({
     helpdesk,
     subject: parsed.subject,
-    requesterEmail: parsed.fromAddress,
-    requesterName: parsed.fromName ?? parsed.fromAddress,
+    requesterEmail,
+    requesterName,
     teamId,
     // Full email body, entire thread included (no quote/signature stripping); a forged first-line
     // relayed-from marker is neutralized (the notice pass reads markers as attribution).
     messageText: neutralizeForgedMarker(parsed.text),
-    customFields: { email: parsed.fromAddress, inbox: normalizedInbox },
+    customFields: { email: requesterEmail, inbox: normalizedInbox },
   });
   step("Helpdesk: createTicket complete", { createdTicketId });
 
@@ -761,7 +794,7 @@ async function handleNewTicket(opts: {
   // still acked (handleExistingTicket), and agent replies still go out via the helpdesk webhook.
 
   const { folderWebUrl, uploadedLinks } = await uploadToTicket({
-    helpdesk, ticketId: createdTicketId, fromAddress: parsed.fromAddress, uploadItems, step, stepError,
+    helpdesk, ticketId: createdTicketId, fromAddress: requesterEmail, uploadItems, step, stepError,
   });
 
   // Only patch a follow-up message if attachments produced something to link. This runs after the

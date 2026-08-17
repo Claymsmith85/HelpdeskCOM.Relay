@@ -131,6 +131,21 @@ export function shouldSuppressRecipient(address: string | null | undefined): boo
   const a = (address ?? "").trim().toLowerCase();
   if (!a) return false;
   if (shouldIgnoreSender(a)) return true;
+  return isMonitoredMailbox(a);
+}
+
+/**
+ * Whether `address` is one of the relay's OWN drain mailboxes (`MAILBOX_ADDRESSES`) — by exact
+ * match (any domain), OR by canonical mailbox key so the SAME mailbox addressed under an alias
+ * company domain is also caught (e.g. `MAILBOX_ADDRESSES` lists `escape@corespecialtyins.com` but
+ * the mailbox is also `escape@corespecialty.com`). The canonical match is gated to in-scope company
+ * domains so an external address that merely shares a local part (`escape@gmail.com`) does NOT
+ * match. Shared by `shouldSuppressRecipient` (outbound loop guard) and the Escape Portal detector
+ * (a portal submission arrives FROM a drain mailbox).
+ */
+export function isMonitoredMailbox(address: string | null | undefined): boolean {
+  const a = (address ?? "").trim().toLowerCase();
+  if (!a) return false;
 
   const monitored = monitoredMailboxAddresses();
   if (monitored.includes(a)) return true; // exact configured mailbox (on any domain)

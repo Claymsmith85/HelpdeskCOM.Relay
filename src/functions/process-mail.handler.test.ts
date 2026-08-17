@@ -581,6 +581,97 @@ describe("new ticket happy path", () => {
   });
 });
 
+describe("Escape Portal submissions", () => {
+  const PORTAL_BODY = [
+    "Thank you for submitting this application via the StarStone Escape Portal.",
+    "",
+    "Producer Information",
+    "",
+    "Contact Name:: Emily Koppang",
+    "Email ID: emily.koppang@rtspecialty.com",
+  ].join("\n");
+
+  // The portal mails the drain mailbox to itself; the submitter exists only in the body.
+  function portalGraphMsg(over: Partial<GraphMessage> = {}): GraphMessage {
+    return graphMsg({
+      subject: "Referral Notification - ESC00595760Q-05",
+      from: { emailAddress: { name: "Escape", address: "escape@corespecialty.com" } },
+      toRecipients: [{ emailAddress: { address: "escape@corespecialty.com" } }],
+      body: { contentType: "text", content: PORTAL_BODY },
+      ...over,
+    });
+  }
+
+  beforeEach(() => {
+    process.env.MAILBOX_ADDRESSES = "escape@corespecialty.com,escapereferrals@corespecialty.com";
+    (getMessage as jest.Mock).mockResolvedValue(portalGraphMsg());
+    hdMock.onGet("/tickets").reply(200, []);
+    hdMock.onPost("/tickets").reply(200, { ID: "NEW1" });
+    hdMock.onGet("/tickets/NEW1").reply(200, { shortID: "SHORT1" });
+    hdMock.onPatch(/\/tickets\/NEW1/).reply(200, {});
+  });
+  afterEach(() => delete process.env.MAILBOX_ADDRESSES);
+
+  it("creates the ticket with the body's Email ID submitter as requester, looked up by that address", async () => {
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    // The existing-ticket lookup is scoped to the extracted submitter, not the mailbox.
+    const lookup = hdMock.history.get.find((g) => g.url === "/tickets");
+    expect(lookup?.params?.requester?.email).toBe("emily.koppang@rtspecialty.com");
+
+    expect(hdMock.history.post).toHaveLength(1);
+    const created = JSON.parse(hdMock.history.post[0].data);
+    expect(created.requester.email).toBe("emily.koppang@rtspecialty.com");
+    expect(created.requester.name).toBe("Emily Koppang");
+    expect(created.customFields.email).toBe("emily.koppang@rtspecialty.com");
+    expect(created.customFields.inbox).toBe("escape@corespecialty.com");
+
+    // Silent create still holds for portal submissions.
+    expect(sendMailViaGraph).not.toHaveBeenCalled();
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+  });
+
+  it("acks the extracted submitter (not the loop-suppressed mailbox) on a resubmission threading into an existing ticket", async () => {
+    hdMock.resetHistory();
+    hdMock.onGet("/tickets").reply(200, [
+      { ID: "EXIST1", shortID: "OLD1", subject: "Referral Notification - ESC00595760Q-05" },
+    ]);
+    hdMock.onGet("/tickets/EXIST1").reply(200, { shortID: "OLD1" });
+    hdMock.onPatch("/tickets/EXIST1").reply(200, {});
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(hdMock.history.post).toHaveLength(0); // appended, no new ticket
+    const ack = (sendMailViaGraph as jest.Mock).mock.calls[0][0];
+    expect(ack.to).toBe("emily.koppang@rtspecialty.com");
+  });
+
+  it("falls back to the mailbox requester when a detection leg fails (forwarded copy: from != to)", async () => {
+    (getMessage as jest.Mock).mockResolvedValue(
+      portalGraphMsg({ toRecipients: [{ emailAddress: { address: "other@corespecialty.com" } }] })
+    );
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    const created = JSON.parse(hdMock.history.post[0].data);
+    expect(created.requester.email).toBe("escape@corespecialty.com");
+    expect(created.customFields.email).toBe("escape@corespecialty.com");
+  });
+
+  it("falls back to the mailbox requester when the Email ID field is missing", async () => {
+    (getMessage as jest.Mock).mockResolvedValue(
+      portalGraphMsg({
+        body: { contentType: "text", content: PORTAL_BODY.replace(/^Email ID:.*$/m, "") },
+      })
+    );
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    const created = JSON.parse(hdMock.history.post[0].data);
+    expect(created.requester.email).toBe("escape@corespecialty.com");
+  });
+});
+
 describe("existing ticket with attachments", () => {
   const EXISTING = { ID: "EXIST1", shortID: "OLD1", subject: "Need help" };
 
