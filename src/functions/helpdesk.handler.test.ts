@@ -201,6 +201,21 @@ describe("tickets.create from Helpdesk", () => {
     expect(sendMock).not.toHaveBeenCalled();
   });
 
+  it("does not echo when the create's last event is a non-message agent event after the customer message", async () => {
+    // e.g. an auto-assignment recorded inside the create payload: last event is agent-authored but
+    // carries no message; the customer's message earlier in the history must not be sent back.
+    const payload = createPayload("client", "Customer's own words");
+    (payload.payload.events as any[]).push({
+      author: { type: "agent" },
+      source: { type: "api" },
+      status: { old: "new", new: "open" },
+    });
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(patchMock).toHaveBeenCalledTimes(1); // customFields patch still runs
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
   it("patches but suppresses the reply when the requester is a monitored mailbox (loop guard)", async () => {
     process.env.MAILBOX_ADDRESSES = "escape@corespecialty.com";
     const payload = createPayload("agent", "Agent reply here");
@@ -284,6 +299,93 @@ describe("tickets.update", () => {
   it("does not email when there is no visible (non-private/non-system) message", async () => {
     await helpdesk(fakeRequest(updatePayload({ text: "" })), fakeContext());
     expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  // The payload's events array is the ticket's FULL history, so a non-message last event always
+  // arrives with the customer's older messages still in the array. These lock in that no UI action
+  // (status change, reassignment, …) can fall back to that history and echo it to the requester.
+  function historyUpdatePayload(lastEvent: any) {
+    return {
+      eventType: "tickets.update",
+      payload: {
+        ID: "T2",
+        shortID: "XYZ",
+        subject: "Open topic",
+        source: { type: "api", detailedSource: "api" },
+        requester: { email: "jane@example.com", name: "Jane" },
+        customFields: { email: "jane@example.com", inbox: "escapereferrals@corespecialty.com" },
+        events: [
+          {
+            author: { type: "client" },
+            source: { type: "email" },
+            message: { text: "Customer's own words", isPrivate: false },
+          },
+          lastEvent,
+        ] as any[],
+      },
+    };
+  }
+
+  it("does not echo the customer's message on an agent status change (the message-less UI event)", async () => {
+    const payload = historyUpdatePayload({
+      author: { type: "agent" },
+      source: { type: "api" },
+      status: { old: "open", new: "solved" },
+    });
+    await helpdesk(fakeRequest(payload), fakeContext());
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("does not echo the customer's message on an agent reassignment", async () => {
+    const payload = historyUpdatePayload({
+      author: { type: "agent" },
+      source: { type: "api" },
+      assignment: {
+        new: { team: { ID: "t2", name: "Team Two" }, agent: { ID: "a2", name: "Agent Two" } },
+        old: { team: { ID: "t1", name: "Team One" } },
+      },
+    });
+    await helpdesk(fakeRequest(payload), fakeContext());
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("does not re-send an older agent reply on a non-message event either", async () => {
+    const payload = historyUpdatePayload({
+      author: { type: "agent" },
+      source: { type: "api" },
+      status: { old: "open", new: "pending" },
+    });
+    (payload.payload.events as any[]).splice(1, 0, {
+      author: { type: "agent" },
+      source: { type: "api" },
+      message: { text: "Yesterday's agent reply", isPrivate: false },
+    });
+    await helpdesk(fakeRequest(payload), fakeContext());
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("does not email on a blank / attachments-only agent reply even with history present", async () => {
+    const payload = historyUpdatePayload({
+      author: { type: "agent" },
+      source: { type: "api" },
+      message: { text: " \n ", isPrivate: false },
+      attachments: { files: [], isPrivate: false },
+    });
+    await helpdesk(fakeRequest(payload), fakeContext());
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("still emails a real agent reply, and sends that event's own text, not the history's", async () => {
+    const payload = historyUpdatePayload({
+      author: { type: "agent" },
+      source: { type: "api" },
+      message: { text: "Fresh agent reply", isPrivate: false },
+    });
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][0].to).toBe("jane@example.com");
+    expect(sendMock.mock.calls[0][0].body).toBe("Fresh agent reply");
   });
 
   it("suppresses the agent reply when the requester is a monitored mailbox (loop guard)", async () => {
