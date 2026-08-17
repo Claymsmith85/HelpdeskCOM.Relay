@@ -1,7 +1,8 @@
 // src/functions/helpdesk.ts
 // Helpdesk webhook handler. On a UI-authored tickets.create it patches the requester email into
 // customFields and (when enabled, only for agent replies) emails the requester; on tickets.update
-// it can email the requester for agent-authored, non-email, non-private, non-system-note events.
+// it emails the requester only when the last event ITSELF is an agent-authored, non-email, public,
+// non-system-note message — non-message events (status/assignment/audience changes) send nothing.
 // Independently enabled notice audiences are handled before those requester-specific gates.
 // Outbound mail goes through Graph sendMail from the shared mailbox. See README
 // "Helpdesk Webhook Flow".
@@ -128,7 +129,9 @@ export async function helpdesk(
   }
 
   /**
-   * tickets.update gates: only agent-authored, non-email events reach the send.
+   * tickets.update gates: only agent-authored, non-email last events proceed, and
+   * selectEmailableAgentMessage then requires the event's OWN public message — a status change,
+   * reassignment, or other non-message event sends nothing.
    */
   if (payload.eventType !== "tickets.update") {
     return { body: "Not a ticket update event" };
@@ -176,22 +179,23 @@ app.http("helpdesk", {
 });
 
 /**
- * The text to email the requester, or null if this event must not be emailed.
- * Shared by the create and update branches: requires an agent-authored last event that is not
- * a system note and not private, then returns the last user-visible message text.
+ * The text to email the requester, or null if nothing may be emailed for this webhook.
+ * Shared by the create and update branches, and anchored strictly to the LAST event — the one the
+ * webhook is about (the classifyLastEvent convention in ticket-notices.ts): it must be
+ * agent-authored AND itself carry a public, non-system-note, non-blank message; that message is
+ * what gets sent. There is deliberately NO fallback to an older visible message: the payload's
+ * events array is the ticket's FULL history, so a fallback turns every agent-authored non-message
+ * event (status change, reassignment, follower/cc edit, attachments-only reply) into an email of
+ * the last visible message on the ticket — usually the customer's own words echoed back to them.
  */
 function selectEmailableAgentMessage(events: TicketEvents): string | null {
   const last = events?.at(-1);
   if (last?.author?.type !== "agent") return null;
-  if (isSystemNoteText(last?.message?.text)) return null;
-  if (last?.message?.text && last.message.isPrivate) return null;
-
-  const lastVisible = events
-    .filter(
-      (e) => e.message?.text && !e.message.isPrivate && !isSystemNoteText(e.message.text)
-    )
-    .at(-1);
-  return lastVisible?.message?.text ?? null;
+  const text = last?.message?.text;
+  if (!text || !text.trim()) return null; // not a message event, or nothing visible to send
+  if (last?.message?.isPrivate) return null;
+  if (isSystemNoteText(text)) return null;
+  return text;
 }
 
 /**
