@@ -44,8 +44,15 @@ import {
   parseRelayedFrom,
   type EmailContent,
 } from "./templates";
+import {
+  buildReplyClaimsClient,
+  claimReply,
+  isReplyClaimed,
+  noticeClaimBlobName,
+} from "./reply-claims";
 
 type TicketEvents = TicketUpdatedPayload["payload"]["events"];
+type TicketEvent = TicketEvents[number];
 
 /** "System note:" detector, shared with helpdesk.ts's requester path (same semantics). */
 export const isSystemNoteText = (t?: string): boolean =>
@@ -53,9 +60,80 @@ export const isSystemNoteText = (t?: string): boolean =>
 
 const emailOk = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 
+// #region Action-event selection (shared with helpdesk.ts's requester path — see its
+// selectEmailableAgentMessage — so the two consumers of "which event is this webhook about"
+// cannot drift apart, the isSystemNoteText precedent)
+
+// A reply that also auto-assigns the ticket (or flips its status) lands its assignment/status
+// companion events AFTER the message inside one action, stamped within moments of each other.
+// The window bounds how far behind the last event a message may sit and still count as part of
+// the same action; anything older is history and must never be (re)surfaced. Same-action events
+// are stamped by Helpdesk's own clock milliseconds apart, so the window can stay far below any
+// humanly-possible reply-then-reassign sequence.
+export const COMPANION_EVENT_WINDOW_MS = 10_000;
+// Paranoia bound on the trailing metadata walk (a real action appends at most a couple).
+const MAX_COMPANION_SKIP = 5;
+
+/** An assignment/status marker with no visible message — skippable when trailing a reply. */
+function isSkippableMetadataEvent(event: TicketEvent | undefined): boolean {
+  if (!event) return false;
+  const text = event.message?.text;
+  if (typeof text === "string" && text.trim()) return false;
+  return Boolean(event.assignment || event.status);
+}
+
+/**
+ * The event a webhook's ACTION is about: normally the last event; when the last event is a
+ * message-less assignment/status marker whose same action also appended a message (a reply that
+ * auto-assigned the ticket or auto-changed its status), the message behind the trailing marker
+ * run — accepted ONLY when its timestamp is within COMPANION_EVENT_WINDOW_MS of the last event,
+ * so an undated or older message never hijacks a standalone reassignment/status change. Every
+ * fallback returns the last event unchanged, so callers that classify metadata events keep doing
+ * so. Returns null only when there are no events.
+ */
+export function selectActionEvent(events: TicketEvents | undefined): TicketEvent | null {
+  const last = events?.at(-1);
+  if (!last) return null;
+
+  if (!isSkippableMetadataEvent(last)) return last;
+  const lastDate = Date.parse(String(last.date ?? ""));
+  if (!Number.isFinite(lastDate)) return last;
+
+  let index = events.length - 1;
+  let skipped = 0;
+  while (index >= 0 && skipped < MAX_COMPANION_SKIP && isSkippableMetadataEvent(events[index])) {
+    index -= 1;
+    skipped += 1;
+  }
+  if (index < 0) return last;
+
+  const candidate = events[index];
+  const text = candidate?.message?.text;
+  if (typeof text !== "string" || !text.trim()) return last; // nearest real event isn't a message
+  const candidateDate = Date.parse(String(candidate.date ?? ""));
+  if (!Number.isFinite(candidateDate)) return last; // undated => cannot prove same-action
+  if (Math.abs(lastDate - candidateDate) > COMPANION_EVENT_WINDOW_MS) return last;
+  return candidate;
+}
+
+/** The event's ID as a send-once claim key, or null when the payload carries none. */
+export function eventClaimId(event: TicketEvent): string | null {
+  const id = (event as { ID?: unknown }).ID;
+  if (typeof id === "number" && Number.isFinite(id)) return String(id);
+  if (typeof id === "string" && id.trim()) return id.trim();
+  return null;
+}
+
+// #endregion
+
 // #region Event classification
 
-export type ClassifiedEvent = { authorId: string | null; authorEmail: string | null } & (
+export type ClassifiedEvent = {
+  authorId: string | null;
+  authorEmail: string | null;
+  /** The classified event's Helpdesk ID (send-once claim key); null when the payload has none. */
+  eventId: string | null;
+} & (
   | {
       kind: "message";
       text: string;
@@ -73,14 +151,17 @@ export type ClassifiedEvent = { authorId: string | null; authorEmail: string | n
 );
 
 /**
- * Classify the LAST event of a webhook payload — the one the notification is about. Returns null
- * for anything that shouldn't produce a notice: no events, an empty message (attachments-only),
+ * Classify the event a webhook payload is about — the last event, or the same-action message a
+ * trailing auto-assignment/status marker hides (selectActionEvent above), so a reply on an
+ * unassigned ticket notices as the reply, not as its companion assignment. Returns null for
+ * anything that shouldn't produce a notice: no events, an empty message (attachments-only),
  * a no-op status or audience change, or an unrecognized event shape.
  */
 export function classifyLastEvent(events: TicketEvents | undefined): ClassifiedEvent | null {
-  const last = events?.at(-1);
+  const last = selectActionEvent(events);
   if (!last) return null;
   const authorId = last.author?.ID ?? null;
+  const eventId = eventClaimId(last);
   // Client-authored events carry the author's email (live payloads; the generated type lags) —
   // surfaced for echo control, so the author of a customer/loop reply never gets self-noticed.
   const rawAuthorEmail = (last.author as { email?: unknown } | undefined)?.email;
@@ -95,6 +176,7 @@ export function classifyLastEvent(events: TicketEvents | undefined): ClassifiedE
       kind: "message",
       authorId,
       authorEmail,
+      eventId,
       text,
       isPrivate: !!last.message?.isPrivate,
       // Anchored to the FIRST line: an event IS a system note only when it starts as one. (The
@@ -112,6 +194,7 @@ export function classifyLastEvent(events: TicketEvents | undefined): ClassifiedE
       kind: "status",
       authorId,
       authorEmail,
+      eventId,
       oldStatus: String(last.status.old ?? ""),
       newStatus: String(last.status.new ?? ""),
     };
@@ -121,6 +204,7 @@ export function classifyLastEvent(events: TicketEvents | undefined): ClassifiedE
       kind: "assignment",
       authorId,
       authorEmail,
+      eventId,
       newTeam: last.assignment.new?.team?.name || undefined,
       newAgent: last.assignment.new?.agent?.name || undefined,
     };
@@ -141,7 +225,7 @@ export function classifyLastEvent(events: TicketEvents | undefined): ClassifiedE
     const added = [...after].filter((e) => !before.has(e));
     const removed = [...before].filter((e) => !after.has(e));
     if (!added.length && !removed.length) return null;
-    return { kind: "cc", authorId, authorEmail, added, removed };
+    return { kind: "cc", authorId, authorEmail, eventId, added, removed };
   }
   const folChange = (last as { followers?: { new?: unknown; old?: unknown } }).followers;
   if (folChange && (Array.isArray(folChange.new) || Array.isArray(folChange.old))) {
@@ -160,7 +244,7 @@ export function classifyLastEvent(events: TicketEvents | undefined): ClassifiedE
     const added = after.filter((f) => !beforeIds.has(f.id)).map((f) => f.label);
     const removed = before.filter((f) => !afterIds.has(f.id)).map((f) => f.label);
     if (!added.length && !removed.length) return null;
-    return { kind: "followers", authorId, authorEmail, added, removed };
+    return { kind: "followers", authorId, authorEmail, eventId, added, removed };
   }
   return null;
 }
@@ -293,6 +377,33 @@ export async function sendTicketNotices(opts: {
     if (!event) {
       step("Notices: last event not noticeable (empty/no-op/unrecognized) — none sent");
       return;
+    }
+
+    // Send-once guard for MESSAGE notices (the helpdesk.ts requester-path convention): the
+    // companion selection above can meet the same message event again on a later metadata webhook
+    // (and a redelivery repeats it verbatim), so a per-(ticket, event) claim caps the fan-out at
+    // one pass per message. Availability-first like the requester path: a storage failure logs and
+    // the notices still go out. Status/assignment/audience notices stay unclaimed — they have no
+    // companion re-selection path, and their redelivery-duplicate exposure is unchanged from today.
+    let noticeClaim: { client: AxiosInstance; name: string } | null = null;
+    if (event.kind === "message" && event.eventId) {
+      const name = noticeClaimBlobName(p.ID, event.eventId);
+      try {
+        const client = await buildReplyClaimsClient();
+        if (await isReplyClaimed(client, name)) {
+          step("Notices: message event already noticed (claimed) — none sent", {
+            ticketId: p.ID,
+            eventId: event.eventId,
+          });
+          return;
+        }
+        noticeClaim = { client, name };
+      } catch (e) {
+        stepError("Notices: claim check failed; sending without the duplicate guard", e, {
+          ticketId: p.ID,
+          eventId: event.eventId,
+        });
+      }
     }
 
     // Shared lazily-memoized agent list: one listAgents call at most, reused by the follower
@@ -521,6 +632,28 @@ export async function sendTicketNotices(opts: {
       followers,
       agent,
     });
+
+    // Claim only after at least one copy actually went out: an all-failed pass must stay
+    // retryable, and an all-suppressed pass re-suppresses harmlessly. Write failure is logged and
+    // accepted — the same bounded duplicate window as the requester path's claim.
+    if (noticeClaim && followers.sent + agent.sent > 0) {
+      try {
+        await claimReply(
+          noticeClaim.client,
+          noticeClaim.name,
+          JSON.stringify({
+            ticketId: p.ID,
+            eventId: event.eventId,
+            sentAt: new Date().toISOString(),
+          })
+        );
+      } catch (e) {
+        stepError("Notices: claim write failed; a later webhook may re-send this notice", e, {
+          ticketId: p.ID,
+          eventId: event.eventId,
+        });
+      }
+    }
   } catch (e) {
     // Best-effort by contract: a notice failure must never fail the webhook.
     stepError("Notices: pass FAILED (ignored)", e, { ticketId: payload.payload?.ID });

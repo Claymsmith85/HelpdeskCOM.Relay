@@ -28,17 +28,29 @@ jest.mock("./ticket-notices", () => ({
   ...jest.requireActual("./ticket-notices"),
   sendTicketNotices: jest.fn().mockResolvedValue(undefined),
 }));
+// Keep the real replyClaimBlobName (the send-once tests assert the claim key); the storage-backed
+// operations are stubbed so no test builds a real blob client.
+jest.mock("./reply-claims", () => ({
+  ...jest.requireActual("./reply-claims"),
+  buildReplyClaimsClient: jest.fn(),
+  isReplyClaimed: jest.fn(),
+  claimReply: jest.fn(),
+}));
 
 import { helpdesk } from "./helpdesk";
 import { createGraphClientFromEnv } from "./graph-client";
 import { sendMailViaGraph } from "./graph-mail";
 import { patchCustomFields } from "./helpdesk-client";
 import { sendTicketNotices } from "./ticket-notices";
+import { buildReplyClaimsClient, claimReply, isReplyClaimed } from "./reply-claims";
 
 const graphMock = createGraphClientFromEnv as jest.Mock;
 const sendMock = sendMailViaGraph as jest.Mock;
 const patchMock = patchCustomFields as jest.Mock;
 const noticesMock = sendTicketNotices as jest.Mock;
+const claimClientMock = buildReplyClaimsClient as jest.Mock;
+const isClaimedMock = isReplyClaimed as jest.Mock;
+const claimReplyMock = claimReply as jest.Mock;
 
 function fakeContext() {
   return { log: jest.fn(), invocationId: "test-inv" } as any;
@@ -54,6 +66,11 @@ beforeEach(() => {
   delete process.env.AGENT_NOTICES;
   delete process.env.FOLLOWERS_NOTICES;
   process.env.SUBMITTER_REPLIES = "true";
+  // Send-once claim happy path: storage reachable, nothing claimed yet. (Implementations live here
+  // rather than the factory because clearMocks/restoreMocks wipe them between tests.)
+  claimClientMock.mockResolvedValue({ id: "storage" });
+  isClaimedMock.mockResolvedValue(false);
+  claimReplyMock.mockResolvedValue(true);
 });
 
 afterEach(() => {
@@ -517,5 +534,166 @@ describe("follower / people-in-the-loop notice pass (FOLLOWERS_NOTICES)", () => 
 
     await expect(helpdesk(fakeRequest(payload), fakeContext())).resolves.toBeDefined();
     expect(sendMock).toHaveBeenCalledTimes(1); // requester email still went out
+  });
+});
+
+// A reply on an unassigned (or otherwise-assigned) ticket makes Helpdesk auto-assign as part of
+// the SAME action, so the webhook's events end [..., message, assignment] — the strict last-event
+// anchor used to drop the reply silently (the agent had to assign themselves and resend). These
+// lock in the companion-skip selection (same-action window) and the per-(ticket, event) send-once
+// claim that keeps the relaxed selection from ever double-emailing the requester.
+describe("same-action companion events (reply that auto-assigns / auto-changes status)", () => {
+  const T0 = "2026-08-17T15:00:00.000Z";
+  const at = (offsetMs: number) => new Date(Date.parse(T0) + offsetMs).toISOString();
+
+  const agentMsg = (over: any = {}) => ({
+    ID: 41,
+    date: T0,
+    author: { type: "agent" },
+    source: { type: "api" },
+    message: { text: "Reply while unassigned", isPrivate: false },
+    ...over,
+  });
+  const autoAssign = (over: any = {}) => ({
+    ID: 42,
+    date: at(800),
+    author: { type: "agent" },
+    source: { type: "api" },
+    assignment: {
+      new: { team: { ID: "t1", name: "Team One" }, agent: { ID: "a1", name: "Agent One" } },
+      old: { team: { ID: "t1", name: "Team One" } },
+    },
+    ...over,
+  });
+  const autoStatus = (over: any = {}) => ({
+    ID: 43,
+    date: at(500),
+    author: { type: "agent" },
+    source: { type: "api" },
+    status: { old: "new", new: "open" },
+    ...over,
+  });
+  // Older history that must never be echoed, whatever the selection does.
+  const oldClientMsg = {
+    ID: 7,
+    date: "2026-08-16T09:00:00.000Z",
+    author: { type: "client" },
+    source: { type: "email" },
+    message: { text: "Customer's own words", isPrivate: false },
+  };
+
+  function update(events: any[]) {
+    return {
+      eventType: "tickets.update",
+      payload: {
+        ID: "T2",
+        shortID: "XYZ",
+        subject: "Open topic",
+        source: { type: "api", detailedSource: "api" },
+        requester: { email: "jane@example.com", name: "Jane" },
+        customFields: { email: "jane@example.com", inbox: "escapereferrals@corespecialty.com" },
+        events,
+      },
+    };
+  }
+
+  it("emails the reply hiding behind a same-action auto-assignment, and claims its event", async () => {
+    await helpdesk(fakeRequest(update([oldClientMsg, agentMsg(), autoAssign()])), fakeContext());
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][0].to).toBe("jane@example.com");
+    expect(sendMock.mock.calls[0][0].body).toBe("Reply while unassigned");
+    // Claimed under the MESSAGE event's id, so any later webhook meeting event 41 again skips it.
+    expect(isClaimedMock).toHaveBeenCalledWith(expect.anything(), "agent-reply-T2_41");
+    expect(claimReplyMock).toHaveBeenCalledWith(
+      expect.anything(),
+      "agent-reply-T2_41",
+      expect.stringContaining('"eventId":"41"')
+    );
+  });
+
+  it("also skips a same-action status companion (and several companions at once)", async () => {
+    await helpdesk(
+      fakeRequest(update([oldClientMsg, agentMsg(), autoStatus(), autoAssign()])),
+      fakeContext()
+    );
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][0].body).toBe("Reply while unassigned");
+  });
+
+  it("does not send when the assignment happens outside the same-action window", async () => {
+    // 30 s between message and reassignment = a human action sequence, not one atomic action.
+    // The message's own webhook already delivered (and claimed) it; re-sending here would dupe.
+    await helpdesk(
+      fakeRequest(update([oldClientMsg, agentMsg(), autoAssign({ date: at(30_000) })])),
+      fakeContext()
+    );
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("still never echoes a customer message behind a fresh assignment (echo guard with dates)", async () => {
+    const clientMsg = agentMsg({ author: { type: "client" } });
+    await helpdesk(fakeRequest(update([clientMsg, autoAssign()])), fakeContext());
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses the companion path when events carry no parseable dates (cannot prove same-action)", async () => {
+    await helpdesk(
+      fakeRequest(update([agentMsg({ date: undefined }), autoAssign({ date: undefined })])),
+      fakeContext()
+    );
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it("skips a message event whose reply was already sent (claim hit = redelivery/companion dedupe)", async () => {
+    isClaimedMock.mockResolvedValue(true);
+    await helpdesk(fakeRequest(update([oldClientMsg, agentMsg()])), fakeContext());
+
+    expect(isClaimedMock).toHaveBeenCalledWith(expect.anything(), "agent-reply-T2_41");
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(claimReplyMock).not.toHaveBeenCalled();
+  });
+
+  it("still sends when the claim check fails (availability over the duplicate guard)", async () => {
+    isClaimedMock.mockRejectedValue(new Error("storage down"));
+    await helpdesk(fakeRequest(update([oldClientMsg, agentMsg()])), fakeContext());
+    expect(sendMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not claim when the send itself fails, so the retry path can still deliver", async () => {
+    sendMock.mockRejectedValueOnce(new Error("graph down"));
+    await expect(
+      helpdesk(fakeRequest(update([oldClientMsg, agentMsg()])), fakeContext())
+    ).resolves.toBeDefined();
+    expect(claimReplyMock).not.toHaveBeenCalled();
+  });
+
+  it("sends unguarded when the message event has no ID (no storage dependency added)", async () => {
+    await helpdesk(fakeRequest(update([agentMsg({ ID: undefined })])), fakeContext());
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(claimClientMock).not.toHaveBeenCalled();
+  });
+
+  it("emails the reply on a tickets.create whose last event is the auto-assignment", async () => {
+    const payload = {
+      eventType: "tickets.create",
+      payload: {
+        ID: "T1",
+        shortID: "ABC",
+        subject: "Customer question",
+        source: { type: "email", detailedSource: "helpdesk" },
+        requester: { email: "john@example.com", name: "John" },
+        customFields: { email: "", inbox: "escape@corespecialty.com" },
+        events: [agentMsg(), autoAssign()],
+      },
+    };
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(patchMock).toHaveBeenCalledTimes(1);
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][0].to).toBe("john@example.com");
+    expect(sendMock.mock.calls[0][0].body).toBe("Reply while unassigned");
   });
 });

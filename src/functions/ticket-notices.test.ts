@@ -5,9 +5,18 @@
 
 jest.mock("./graph-mail", () => ({ sendMailViaGraph: jest.fn().mockResolvedValue(undefined) }));
 jest.mock("./helpdesk-client", () => ({ listAgents: jest.fn() }));
+// Keep the real noticeClaimBlobName (the send-once tests assert the claim key); the storage-backed
+// operations are stubbed so no test builds a real blob client.
+jest.mock("./reply-claims", () => ({
+  ...jest.requireActual("./reply-claims"),
+  buildReplyClaimsClient: jest.fn(),
+  isReplyClaimed: jest.fn(),
+  claimReply: jest.fn(),
+}));
 
 import { sendMailViaGraph } from "./graph-mail";
 import { listAgents } from "./helpdesk-client";
+import { buildReplyClaimsClient, claimReply, isReplyClaimed } from "./reply-claims";
 import {
   classifyLastEvent,
   extractNoticeRecipients,
@@ -16,9 +25,19 @@ import {
 
 const sendMock = sendMailViaGraph as jest.Mock;
 const agentsMock = listAgents as jest.Mock;
+const claimClientMock = buildReplyClaimsClient as jest.Mock;
+const isClaimedMock = isReplyClaimed as jest.Mock;
+const claimReplyMock = claimReply as jest.Mock;
 
 const step = jest.fn();
 const stepError = jest.fn();
+
+beforeEach(() => {
+  // Send-once claim happy path: storage reachable, nothing claimed yet.
+  claimClientMock.mockResolvedValue({ id: "storage" });
+  isClaimedMock.mockResolvedValue(false);
+  claimReplyMock.mockResolvedValue(true);
+});
 
 afterEach(() => {
   jest.clearAllMocks();
@@ -651,6 +670,112 @@ describe("sendTicketNotices", () => {
   it("resolves even when the whole pass blows up (best-effort by contract)", async () => {
     agentsMock.mockRejectedValue(new Error("helpdesk down"));
     await expect(callNotices(payload())).resolves.toBeUndefined();
+  });
+});
+
+// #endregion
+
+// #region Same-action companion events + notice send-once claim
+
+// A reply that auto-assigns the ticket lands [..., message, assignment] in one action; the
+// classifier must surface the reply (the content people care about), not its companion assignment
+// marker — mirroring helpdesk.ts's requester-path fix — while a standalone reassignment still
+// notices as an assignment. The per-(ticket, event) claim caps the message fan-out at one pass.
+describe("same-action companion events and the notice send-once claim", () => {
+  beforeEach(() => {
+    agentsMock.mockResolvedValue([{ ID: "ag1", email: FOLLOWER }]);
+  });
+
+  const T0 = "2026-08-17T15:00:00.000Z";
+  const at = (offsetMs: number) => new Date(Date.parse(T0) + offsetMs).toISOString();
+
+  const agentMsg = (over: any = {}) => ({
+    ID: 41,
+    date: T0,
+    author: { type: "agent", ID: "ag9", name: "Sam Agent" },
+    source: { type: "api" },
+    message: { text: "Reply while unassigned", isPrivate: false },
+    ...over,
+  });
+  const autoAssign = (over: any = {}) => ({
+    ID: 42,
+    date: at(800),
+    author: { type: "agent", ID: "ag9", name: "Sam Agent" },
+    source: { type: "api" },
+    assignment: {
+      new: { team: { ID: "t1", name: "Escape" }, agent: { ID: "ag9", name: "Sam Agent" } },
+      old: { team: { ID: "t1", name: "Escape" } },
+    },
+    ...over,
+  });
+
+  it("classifies the message hiding behind a same-action auto-assignment, with its event ID", () => {
+    const ev = classifyLastEvent([agentMsg(), autoAssign()] as any);
+    expect(ev).toMatchObject({
+      kind: "message",
+      text: "Reply while unassigned",
+      authorId: "ag9",
+      eventId: "41",
+    });
+  });
+
+  it("still classifies a standalone reassignment as an assignment (window refused)", () => {
+    const ev = classifyLastEvent([agentMsg(), autoAssign({ date: at(30_000) })] as any);
+    expect(ev).toMatchObject({ kind: "assignment", newAgent: "Sam Agent", eventId: "42" });
+  });
+
+  it("refuses the companion path when events carry no parseable dates", () => {
+    const ev = classifyLastEvent([
+      agentMsg({ date: undefined }),
+      autoAssign({ date: undefined }),
+    ] as any);
+    expect(ev).toMatchObject({ kind: "assignment", eventId: "42" });
+  });
+
+  it("notices the reply (not the assignment) to followers when a reply auto-assigns, then claims it", async () => {
+    await callNotices(payload({ events: [agentMsg(), autoAssign()] }));
+
+    expect(sendMock.mock.calls.map((c) => c[0].to).sort()).toEqual([FOLLOWER, LOOP]);
+    expect(sendMock.mock.calls[0][0].body).toContain("Reply while unassigned");
+    expect(isClaimedMock).toHaveBeenCalledWith(expect.anything(), "ticket-notice-T1_41");
+    expect(claimReplyMock).toHaveBeenCalledWith(
+      expect.anything(),
+      "ticket-notice-T1_41",
+      expect.stringContaining('"eventId":"41"')
+    );
+  });
+
+  it("skips the whole pass when the message event is already claimed", async () => {
+    isClaimedMock.mockResolvedValue(true);
+    await callNotices(payload({ events: [agentMsg()] }));
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(claimReplyMock).not.toHaveBeenCalled();
+  });
+
+  it("still sends when the claim check fails (availability over the duplicate guard)", async () => {
+    isClaimedMock.mockRejectedValue(new Error("storage down"));
+    await callNotices(payload({ events: [agentMsg()] }));
+
+    expect(sendMock).toHaveBeenCalledTimes(2);
+    expect(claimReplyMock).not.toHaveBeenCalled(); // no verified-unclaimed client to write with
+  });
+
+  it("does not claim when every send fails, so a redelivery can retry", async () => {
+    sendMock.mockRejectedValue(new Error("graph down"));
+    await callNotices(payload({ events: [agentMsg()] }));
+
+    expect(claimReplyMock).not.toHaveBeenCalled();
+  });
+
+  it("never touches claims for message events without an ID or for non-message events", async () => {
+    await callNotices(payload({ events: [agentMsg({ ID: undefined })] }));
+    await callNotices(
+      payload({ events: [autoAssign({ date: at(30_000) })] }) // standalone assignment notice
+    );
+
+    expect(claimClientMock).not.toHaveBeenCalled();
+    expect(sendMock).toHaveBeenCalled();
   });
 });
 
