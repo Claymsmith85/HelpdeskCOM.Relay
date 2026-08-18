@@ -2,6 +2,8 @@
 // registration side effects, so no @azure/functions mock is needed.
 
 import {
+  hasMonitoredMailboxes,
+  mailboxForTeam,
   normalizeInbox,
   routeTeam,
   shouldIgnoreSender,
@@ -141,5 +143,52 @@ describe("shouldSuppressRecipient (outbound loop guard)", () => {
     expect(shouldSuppressRecipient("")).toBe(false);
     expect(shouldSuppressRecipient(null)).toBe(false);
     expect(shouldSuppressRecipient(undefined)).toBe(false);
+  });
+});
+
+describe("mailboxForTeam", () => {
+  it("maps known teams to the mailbox they answer from (the reverse of routeTeam)", () => {
+    expect(mailboxForTeam(TEAM_ESCAPE)).toBe("escape@corespecialty.com");
+    expect(mailboxForTeam(TEAM_ESCAPE_REFERRALS)).toBe("escapereferrals@corespecialty.com");
+    expect(mailboxForTeam("c4e7bc52-0c7a-43fb-aa46-0d69f533ee2b")).toBe(
+      "escapeendorsements@corespecialty.com"
+    );
+    // The dev/IT team answers from the Dev Escape mailbox (TEAM_BY_INBOX is many-to-one here, so the
+    // reverse direction has to be an explicit choice — see MAILBOX_BY_TEAM).
+    expect(mailboxForTeam(TEAM_UREFERRALS)).toBe("ureferrals@corespecialty.com");
+  });
+
+  it("round-trips every mapped mailbox through routeTeam", () => {
+    for (const mailbox of [
+      "escape@corespecialty.com",
+      "escapereferrals@corespecialty.com",
+      "escapeendorsements@corespecialty.com",
+      "ureferrals@corespecialty.com",
+    ]) {
+      expect(mailboxForTeam(routeTeam(mailbox))).toBe(mailbox);
+    }
+  });
+
+  it("returns null (never a guess) for a team that owns no mailbox", () => {
+    expect(mailboxForTeam("4533d6c2-98fc-4563-855a-c5205f4c856d")).toBeNull(); // Mgmt. Team
+    expect(mailboxForTeam("not-a-team")).toBeNull();
+    expect(mailboxForTeam("  ")).toBeNull();
+    expect(mailboxForTeam(null)).toBeNull();
+    expect(mailboxForTeam(undefined)).toBeNull();
+  });
+});
+
+describe("hasMonitoredMailboxes", () => {
+  afterEach(() => {
+    delete process.env.MAILBOX_ADDRESSES;
+  });
+
+  it("is true only when MAILBOX_ADDRESSES lists something", () => {
+    delete process.env.MAILBOX_ADDRESSES;
+    expect(hasMonitoredMailboxes()).toBe(false);
+    process.env.MAILBOX_ADDRESSES = " , ";
+    expect(hasMonitoredMailboxes()).toBe(false);
+    process.env.MAILBOX_ADDRESSES = "escape@corespecialty.com";
+    expect(hasMonitoredMailboxes()).toBe(true);
   });
 });

@@ -38,7 +38,8 @@ src/
     sharepoint.ts          # Graph upload helpers (site/drive/folder; content PUT or chunked session)
     helpdesk-client.ts     # Helpdesk REST client + ticket operations
     rate-limit.ts          # Process-local fixed-interval Helpdesk request pacing
-    routing.ts             # Inbox -> team routing + inbound loop guard
+    routing.ts             # Inbox -> team routing, team -> mailbox, inbound/outbound loop guards
+    reply-mailbox.ts       # Which mailbox webhook mail is sent AS (the ASSIGNED TEAM's mailbox)
     logging.ts             # Shared step / buffered loggers
     subscriptions.ts       # Graph subscription create/renew
     subject.ts             # "[#shortID]" subject-threading helpers
@@ -193,7 +194,37 @@ Outbound triggers:
 - Follower / people-in-the-loop notices on ticket events (via `helpdesk`, gated by `FOLLOWERS_NOTICES`).
 - Debug message (errors only, when `SEND_DEBUG_EMAIL=true`) — sent from a real shared mailbox.
 
-All relay email is sent from the relevant shared mailbox (the inbox the mail was addressed to / `customFields.inbox`, defaulting to `escape@corespecialty.com`).
+Which shared mailbox each message is sent **as** depends on the trigger:
+
+- **`process-mail` (inbound acks, debug mail)** — the mailbox the customer's email actually landed
+  in. A reply has to come back from the address it was sent to.
+- **`helpdesk` (agent replies to the requester, assigned-agent and follower/cc notices)** — the
+  mailbox owned by the team the ticket is **assigned to at the time of the event**
+  (`reply-mailbox.ts` → `routing.ts`'s `MAILBOX_BY_TEAM`, the reverse of the inbound
+  `TEAM_BY_INBOX`). Tickets get reassigned between teams (Escape → Escape Referrals → Escape
+  Endorsements), and `customFields.inbox` is stamped once at ticket creation and never changes — so
+  sending from the recorded inbox meant the requester's reply came back to a mailbox the responding
+  team no longer owns. One resolution per webhook delivery, shared by all audiences, so a single
+  event never sends some of its mail as one mailbox and the rest as another.
+
+| Assigned team | Sends as |
+|---|---|
+| Escape | `escape@corespecialty.com` |
+| Escape Referrals | `escapereferrals@corespecialty.com` |
+| Escape Endorsements | `escapeendorsements@corespecialty.com` |
+| Development / IT Support (Dev) | `ureferrals@corespecialty.com` |
+
+A team with no mapped mailbox (Mgmt., a brand-new team) and an unassigned ticket both fall back to
+**`escape@corespecialty.com`** — deliberately not to `customFields.inbox`, which is the stale value
+this whole mechanism exists to stop trusting. One exception: if the assigned team's mailbox is **not**
+in this app's `MAILBOX_ADDRESSES`, the recorded inbox is used instead, because Graph `sendMail` would
+403 on a mailbox outside the app's Exchange Application Access Policy and the recorded inbox is a
+mailbox this app demonstrably drains (Dev and Prod share one Helpdesk account, so the Dev app does
+see Production team IDs). Every resolution is logged by the `Mailbox: resolved sender` step with its
+`source` and `reason`, so a ticket answering from an unexpected address is one query away. **Adding a
+mailbox/team pair is a one-line edit to `MAILBOX_BY_TEAM` in `routing.ts`** (kept in code so the team
+IDs are PR-reviewed, like `TEAM_BY_INBOX` and `team-mapping.ts`) — a new drain mailbox needs **both**
+directions, or its team's replies keep going out from Escape.
 
 ---
 

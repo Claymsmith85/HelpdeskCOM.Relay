@@ -3,7 +3,6 @@
 
 // Map normalized inbox -> Helpdesk team ID.
 const TEAM_BY_INBOX: Record<string, string> = {
-  "ingestion@core-parser-01-dev@corespecialty.com": "61ed7601-b6e3-43c2-936a-7afe45e4e246", // Just for Dev and testing.
   "ureferrals@corespecialty.com": "61ed7601-b6e3-43c2-936a-7afe45e4e246", // Official Dev mailbox for Escape.
   "escape@corespecialty.com": "3db812da-2055-436f-9889-7073b5e976f4",
   "escapereferrals@corespecialty.com": "3a5e9d73-e5a0-442e-888b-6573672c9d05",
@@ -12,6 +11,46 @@ const TEAM_BY_INBOX: Record<string, string> = {
 
 // If we don't know which team, Escape.
 const DEFAULT_TEAM_ID = TEAM_BY_INBOX["escape@corespecialty.com"];
+
+// Helpdesk team ID -> the shared mailbox that team answers FROM. The reverse of TEAM_BY_INBOX, but
+// written out rather than derived, for two reasons: TEAM_BY_INBOX is many-to-one (the dev/IT team is
+// reachable from more than one inbox, so an inverted map would pick its winner by object-key order),
+// and a team that owns no mailbox (Mgmt., a role-only team) must resolve to *nothing* here so the
+// caller can fall back instead of silently sending as some other team's mailbox.
+//
+// This exists because a ticket's `customFields.inbox` records where the ORIGINAL email landed and
+// never changes; once the ticket is reassigned to another team, that inbox is no longer the mailbox
+// the responding team owns. Outbound webhook mail (agent replies to the requester, follower/cc and
+// assigned-agent notices) is addressed FROM the assigned team's mailbox instead — see
+// reply-mailbox.ts. Inbound acks from process-mail.ts are unaffected: they answer from the mailbox
+// the customer actually wrote to.
+const MAILBOX_BY_TEAM: Record<string, string> = {
+  "3db812da-2055-436f-9889-7073b5e976f4": "escape@corespecialty.com", // Escape
+  "3a5e9d73-e5a0-442e-888b-6573672c9d05": "escapereferrals@corespecialty.com", // Escape Referrals
+  "c4e7bc52-0c7a-43fb-aa46-0d69f533ee2b": "escapeendorsements@corespecialty.com", // Escape Endorsements
+  "61ed7601-b6e3-43c2-936a-7afe45e4e246": "ureferrals@corespecialty.com", // Development / IT Support (the Dev Escape mailbox)
+};
+
+/**
+ * The shared mailbox a Helpdesk team answers from, or `null` when the team owns no mailbox (an
+ * unmapped/new team, a non-mail team like Mgmt., or a blank/absent team ID). Never guesses: a null
+ * return is the caller's signal to fall back (see `resolveReplyMailbox` in reply-mailbox.ts).
+ */
+export function mailboxForTeam(teamId: string | null | undefined): string | null {
+  const id = (teamId ?? "").trim();
+  if (!id) return null;
+  return MAILBOX_BY_TEAM[id] ?? null;
+}
+
+/**
+ * Whether `MAILBOX_ADDRESSES` lists any mailbox at all. Used by `resolveReplyMailbox` to decide
+ * whether its "can this app actually send AS that mailbox" check is meaningful — with no configured
+ * mailboxes (unit tests, a half-configured app) every address fails `isMonitoredMailbox`, and the
+ * check would reject every team mailbox.
+ */
+export function hasMonitoredMailboxes(): boolean {
+  return monitoredMailboxAddresses().length > 0;
+}
 
 // Senders that should never generate tickets (loops / system senders).
 const IGNORED_SENDER_PATTERNS = ["helpdesk.com", "corespecialty.onmicrosoft.com"];
