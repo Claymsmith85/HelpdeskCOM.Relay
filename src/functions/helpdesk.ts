@@ -8,7 +8,10 @@
 // selectEmailableAgentMessage). Standalone non-message events (status/assignment/audience changes)
 // still send nothing, and a per-(ticket, event) claim makes each message event's requester email
 // send-once across webhooks. Independently enabled notice audiences are handled before those
-// requester-specific gates. Outbound mail goes through Graph sendMail from the shared mailbox.
+// requester-specific gates. Outbound mail goes through Graph sendMail from the shared mailbox owned
+// by the team the ticket is ASSIGNED to (resolved once per delivery — see reply-mailbox.ts), so a
+// reassigned ticket answers from the mailbox the responding team drains rather than the one the
+// original email happened to land in.
 // See README "Helpdesk Webhook Flow".
 import {
   app,
@@ -45,9 +48,10 @@ import {
   isReplyClaimed,
   replyClaimBlobName,
 } from "./reply-claims";
-
-// Default shared mailbox to send agent replies from when customFields.inbox is absent.
-const DEFAULT_INBOX = "escape@corespecialty.com";
+// Which shared mailbox this webhook's mail goes out AS: the ASSIGNED TEAM's mailbox, not the
+// ticket's stamped-once customFields.inbox (which stops matching the responding team the moment the
+// ticket is reassigned). Falls back to that inbox for a team that owns no mailbox.
+import { resolveReplyMailbox } from "./reply-mailbox";
 
 type TicketPayload = TicketUpdatedPayload;
 type TicketEvents = TicketUpdatedPayload["payload"]["events"];
@@ -83,6 +87,19 @@ export async function helpdesk(
     ticketId: payload.payload.ID,
   });
 
+  // One resolution per webhook, shared by every audience below (requester reply, follower/cc and
+  // assigned-agent notices) so a single delivery can never send some of its mail as one mailbox and
+  // the rest as another. Tied to the team assigned at the time of this event, so a reassigned ticket
+  // answers from — and its replies come back to — the mailbox the responding team actually owns.
+  const replyMailbox = resolveReplyMailbox(payload);
+  step("Mailbox: resolved sender", {
+    mailbox: replyMailbox.mailbox,
+    source: replyMailbox.source,
+    teamId: replyMailbox.teamId,
+    inbox: payload.payload.customFields?.inbox ?? null,
+    ...(replyMailbox.reason ? { reason: replyMailbox.reason } : {}),
+  });
+
   const graph = await createGraphClientFromEnv();
 
   /**
@@ -101,7 +118,7 @@ export async function helpdesk(
         graph,
         helpdesk: createHelpdeskClient(),
         payload,
-        mailbox: payload.payload.customFields?.inbox ?? DEFAULT_INBOX,
+        mailbox: replyMailbox.mailbox,
         step,
         stepError,
         followers: followersOn,
@@ -140,6 +157,7 @@ export async function helpdesk(
             payload,
             selection,
             email || payload.payload.customFields.email,
+            replyMailbox.mailbox,
             step,
             stepError
           );
@@ -192,6 +210,7 @@ export async function helpdesk(
       payload,
       selection,
       payload.payload.customFields.email,
+      replyMailbox.mailbox,
       step,
       stepError
     );
@@ -260,6 +279,7 @@ async function sendAgentReplyOnce(
   payload: TicketPayload,
   selection: EmailableSelection,
   toEmail: string,
+  mailbox: string,
   step: StepFn,
   stepError: StepErrorFn
 ): Promise<void> {
@@ -287,8 +307,8 @@ async function sendAgentReplyOnce(
     }
   }
 
-  const sent = await sendAgentReply(graph, payload, selection.text, toEmail, step);
-  if (sent) step("Agent reply emailed", { ticketId, eventId });
+  const sent = await sendAgentReply(graph, payload, selection.text, toEmail, mailbox, step);
+  if (sent) step("Agent reply emailed", { ticketId, eventId, mailbox });
 
   if (sent && claimName) {
     try {
@@ -308,7 +328,10 @@ async function sendAgentReplyOnce(
 }
 
 /**
- * Email the requester an agent reply (text only) from the ticket's shared mailbox.
+ * Email the requester an agent reply (text only) from the shared mailbox the caller resolved — the
+ * ASSIGNED TEAM's mailbox (reply-mailbox.ts), so a reassigned ticket stops answering from the
+ * mailbox the original email happened to land in and the requester's reply comes back to the team
+ * that is working it.
  *
  * Loop guard: if the requester resolves to one of our own drain mailboxes (a MAILBOX_ADDRESSES
  * entry, or the same mailbox under an alias company domain), the reply is suppressed — sending it
@@ -321,6 +344,7 @@ async function sendAgentReply(
   payload: TicketPayload,
   text: string,
   toEmail: string,
+  mailbox: string,
   step: StepFn
 ): Promise<boolean> {
   if (shouldSuppressRecipient(toEmail)) {
@@ -334,7 +358,7 @@ async function sendAgentReply(
   });
   await sendMailViaGraph({
     graph,
-    mailbox: payload.payload.customFields.inbox ?? DEFAULT_INBOX,
+    mailbox,
     to: toEmail,
     subject,
     body,

@@ -266,6 +266,12 @@ describe("tickets.update", () => {
         source: { type: "api", detailedSource: "api" },
         requester: { email: "jane@example.com", name: "Jane" },
         customFields: { email: customEmail, inbox: "escapereferrals@corespecialty.com" },
+        // Assigned to the Escape Referrals team — the mailbox every send below must come from (a
+        // live payload always carries the assignment; the sender follows it, not customFields.inbox).
+        assignment: {
+          team: { ID: "3a5e9d73-e5a0-442e-888b-6573672c9d05", name: "Escape Referrals" },
+          agent: { ID: "a1", name: "Agent One" },
+        },
         events: [
           { author: { type: lastAuthorType }, source: { type: lastSourceType }, message: { text, isPrivate: false } },
         ],
@@ -458,6 +464,10 @@ describe("follower / people-in-the-loop notice pass (FOLLOWERS_NOTICES)", () => 
         source: { type: "api", detailedSource: "api" },
         requester: { email: "jane@example.com", name: "Jane" },
         customFields: { email: "", inbox: "escapereferrals@corespecialty.com" },
+        assignment: {
+          team: { ID: "3a5e9d73-e5a0-442e-888b-6573672c9d05", name: "Escape Referrals" },
+          agent: { ID: "a1", name: "Agent One" },
+        },
         followers: [{ ID: "ag1" }],
         cc: ["loop@example.com"],
         events: [
@@ -513,9 +523,10 @@ describe("follower / people-in-the-loop notice pass (FOLLOWERS_NOTICES)", () => 
     expect(sendMock.mock.calls[0][0].to).toBe("jane@example.com");
   });
 
-  it("falls back to the default inbox when customFields has no inbox", async () => {
+  it("falls back to the Escape mailbox when the ticket has no team the relay can place", async () => {
     process.env.FOLLOWERS_NOTICES = "true";
     const payload = clientUpdate() as any;
+    delete payload.payload.assignment;
     delete payload.payload.customFields.inbox;
 
     await helpdesk(fakeRequest(payload), fakeContext());
@@ -695,5 +706,99 @@ describe("same-action companion events (reply that auto-assigns / auto-changes s
     expect(sendMock).toHaveBeenCalledTimes(1);
     expect(sendMock.mock.calls[0][0].to).toBe("john@example.com");
     expect(sendMock.mock.calls[0][0].body).toBe("Reply while unassigned");
+  });
+});
+
+// The sending mailbox follows the ticket's ASSIGNED TEAM, not customFields.inbox (which records
+// where the original email landed and never changes). Without this, a ticket reassigned from Escape
+// to Escape Referrals keeps answering as escape@, so the requester's reply comes back to a mailbox
+// the responding team doesn't own. Resolution itself is unit-tested in reply-mailbox.test.ts; these
+// lock in that the handler applies it to BOTH audiences of one delivery.
+describe("sender mailbox follows the assigned team", () => {
+  const TEAM_REFERRALS = "3a5e9d73-e5a0-442e-888b-6573672c9d05";
+  const MB_REFERRALS = "escapereferrals@corespecialty.com";
+
+  // Landed at escape@ (customFields.inbox), since reassigned to the Escape Referrals team.
+  function reassignedUpdate(over: any = {}) {
+    return {
+      eventType: "tickets.update",
+      payload: {
+        ID: "T9",
+        shortID: "RE1",
+        subject: "Reassigned topic",
+        source: { type: "api", detailedSource: "api" },
+        requester: { email: "jane@example.com", name: "Jane" },
+        customFields: { email: "jane@example.com", inbox: "escape@corespecialty.com" },
+        assignment: { team: { ID: TEAM_REFERRALS, name: "Escape Referrals" }, agent: { ID: "a1", name: "A" } },
+        followers: [{ ID: "ag1" }],
+        cc: ["loop@example.com"],
+        events: [
+          { ID: 91, author: { type: "agent" }, source: { type: "api" }, message: { text: "Agent reply", isPrivate: false } },
+        ],
+        ...over,
+      },
+    };
+  }
+
+  it("sends the requester reply as the assigned team's mailbox, not the recorded inbox", async () => {
+    await helpdesk(fakeRequest(reassignedUpdate()), fakeContext());
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][0].mailbox).toBe(MB_REFERRALS);
+    expect(sendMock.mock.calls[0][0].to).toBe("jane@example.com");
+  });
+
+  it("uses the same mailbox for the notice audiences in that delivery", async () => {
+    process.env.FOLLOWERS_NOTICES = "true";
+    process.env.AGENT_NOTICES = "true";
+
+    await helpdesk(fakeRequest(reassignedUpdate()), fakeContext());
+
+    expect(noticesMock.mock.calls[0][0].mailbox).toBe(MB_REFERRALS);
+    expect(sendMock.mock.calls[0][0].mailbox).toBe(MB_REFERRALS);
+  });
+
+  it("follows a reassignment recorded only in the event history", async () => {
+    // No assignment snapshot on the payload; the reassignment event is the evidence.
+    const payload = reassignedUpdate({ assignment: null }) as any;
+    payload.payload.events = [
+      {
+        ID: 90,
+        author: { type: "agent" },
+        source: { type: "api" },
+        assignment: {
+          new: { team: { ID: TEAM_REFERRALS, name: "Escape Referrals" }, agent: { ID: "a1", name: "A" } },
+          old: { team: { ID: "3db812da-2055-436f-9889-7073b5e976f4", name: "Escape" } },
+        },
+      },
+      { ID: 91, author: { type: "agent" }, source: { type: "api" }, message: { text: "Agent reply", isPrivate: false } },
+    ];
+
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(sendMock.mock.calls[0][0].mailbox).toBe(MB_REFERRALS);
+  });
+
+  it("falls back to the Escape mailbox when the assigned team owns no mailbox", async () => {
+    const payload = reassignedUpdate({
+      assignment: { team: { ID: "4533d6c2-98fc-4563-855a-c5205f4c856d", name: "Mgmt. Team" }, agent: { ID: "a1", name: "A" } },
+      customFields: { email: "jane@example.com", inbox: "escapeendorsements@corespecialty.com" },
+    });
+
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(sendMock.mock.calls[0][0].mailbox).toBe("escape@corespecialty.com");
+  });
+
+  it("sends the create-branch reply as the assigned team's mailbox too", async () => {
+    const payload = reassignedUpdate() as any;
+    payload.eventType = "tickets.create";
+    payload.payload.source = { type: "email", detailedSource: "helpdesk" };
+
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(patchMock).toHaveBeenCalledTimes(1);
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][0].mailbox).toBe(MB_REFERRALS);
   });
 });
