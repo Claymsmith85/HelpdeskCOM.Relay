@@ -30,6 +30,12 @@ export type AttachmentInfo = {
 
 export type AttachmentMeta = { filename: string; size: number };
 
+export type OutboundMailAttachment = {
+  name: string;
+  contentType: string;
+  contentBytes: string; // base64
+};
+
 // #endregion
 
 // #region Graph message shapes
@@ -323,14 +329,25 @@ export async function sendMailViaGraph(opts: {
   to: string;
   subject: string;
   body: string;
+  attachments?: OutboundMailAttachment[];
   saveToSentItems?: boolean;
 }): Promise<void> {
-  const { graph, mailbox, to, subject, body, saveToSentItems = true } = opts;
+  const { graph, mailbox, to, subject, body, attachments = [], saveToSentItems = true } = opts;
   await graph.post(`/users/${encodeURIComponent(mailbox)}/sendMail`, {
     message: {
       subject,
       body: { contentType: "Text", content: body },
       toRecipients: [{ emailAddress: { address: to } }],
+      ...(attachments.length
+        ? {
+            attachments: attachments.map((a) => ({
+              "@odata.type": "#microsoft.graph.fileAttachment",
+              name: a.name,
+              contentType: a.contentType,
+              contentBytes: a.contentBytes,
+            })),
+          }
+        : {}),
     },
     saveToSentItems,
   });

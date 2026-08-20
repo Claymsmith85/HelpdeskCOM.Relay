@@ -280,6 +280,26 @@ jobs:
                 "value": "${{ vars.FOLLOWERS_NOTICES }}"
               },
               {
+                "name": "OUTBOUND_INLINE_ATTACHMENT_MAX_BYTES",
+                "slotSetting": false,
+                "value": "${{ vars.OUTBOUND_INLINE_ATTACHMENT_MAX_BYTES }}"
+              },
+              {
+                "name": "HELPDESK_GATE_ENABLED",
+                "slotSetting": false,
+                "value": "${{ vars.HELPDESK_GATE_ENABLED }}"
+              },
+              {
+                "name": "HELPDESK_GATE_DEFAULT_COOLDOWN_MS",
+                "slotSetting": false,
+                "value": "${{ vars.HELPDESK_GATE_DEFAULT_COOLDOWN_MS }}"
+              },
+              {
+                "name": "HELPDESK_GATE_DEFER_ABOVE_MS",
+                "slotSetting": false,
+                "value": "${{ vars.HELPDESK_GATE_DEFER_ABOVE_MS }}"
+              },
+              {
                 "name": "USERMGMT_TOGGLE",
                 "slotSetting": false,
                 "value": "${{ vars.USERMGMT_TOGGLE }}"

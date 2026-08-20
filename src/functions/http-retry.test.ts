@@ -151,4 +151,24 @@ describe("attachRetryInterceptor (end to end)", () => {
     await instance.get("/x");
     expect(delays).toEqual([45_000]);
   });
+
+  // maxDelayMs must bound the delay actually slept, jitter included. It previously capped only the
+  // exponential term and then added up to baseDelayMs on top, so the real ceiling was
+  // maxDelayMs + baseDelayMs and grew with baseDelayMs — which meant a caller could not bound (or a
+  // test pin) the ladder by lowering maxDelayMs.
+  it("never sleeps longer than maxDelayMs, jitter included", async () => {
+    const { delays, sleep } = recordingSleep();
+    const { instance, mock } = client({
+      baseDelayMs: 5_000,
+      maxDelayMs: 1_000,
+      maxRetries: 4,
+      sleep,
+    });
+    mock.onGet("/x").reply(503);
+
+    await instance.get("/x").catch(() => undefined);
+
+    expect(delays).toHaveLength(4);
+    for (const d of delays) expect(d).toBeLessThanOrEqual(1_000);
+  });
 });

@@ -90,6 +90,7 @@ import {
   isMessageClaimed,
   releaseMessageClaim,
 } from "./mail-claims";
+import { helpdeskGate } from "./helpdesk-gate";
 
 const TEAM_ESCAPE = "3db812da-2055-436f-9889-7073b5e976f4";
 const MAILBOX = "MB-GUID";
@@ -570,7 +571,7 @@ describe("new ticket happy path", () => {
     expect(created.requester.email).toBe("john@example.com");
     expect(created.requester.name).toBe("John Doe");
     expect(created.assignment.team.ID).toBe(TEAM_ESCAPE);
-    expect(created.customFields.email).toBe("john@example.com");
+    expect(created.customFields.email).toBeUndefined(); // retired field is no longer written
     expect(created.customFields.inbox).toBe("escape@corespecialty.com");
     expect(created.message.text).toBe("Hello there\n> quoted reply line"); // full thread preserved (no cleaning)
 
@@ -623,7 +624,7 @@ describe("Escape Portal submissions", () => {
     const created = JSON.parse(hdMock.history.post[0].data);
     expect(created.requester.email).toBe("emily.koppang@rtspecialty.com");
     expect(created.requester.name).toBe("Emily Koppang");
-    expect(created.customFields.email).toBe("emily.koppang@rtspecialty.com");
+    expect(created.customFields.email).toBeUndefined(); // retired field is no longer written
     expect(created.customFields.inbox).toBe("escape@corespecialty.com");
 
     // Silent create still holds for portal submissions.
@@ -655,7 +656,7 @@ describe("Escape Portal submissions", () => {
 
     const created = JSON.parse(hdMock.history.post[0].data);
     expect(created.requester.email).toBe("escape@corespecialty.com");
-    expect(created.customFields.email).toBe("escape@corespecialty.com");
+    expect(created.customFields.email).toBeUndefined(); // retired field is no longer written
   });
 
   it("falls back to the mailbox requester when the Email ID field is missing", async () => {
@@ -1502,4 +1503,85 @@ describe("non-requester reply threading (FOLLOWERS_NOTICES)", () => {
     expect(sendMailViaGraph).not.toHaveBeenCalled();
     expect(moveMessageToFolder).not.toHaveBeenCalled(); // message stays for the retry
   }, 15000); // the GET is retried by the real backoff interceptor (~4s) before failing
+});
+
+// The global Helpdesk throttle gate, exercised end-to-end through the drain. The unit behavior of
+// the gate itself lives in helpdesk-gate.test.ts; what matters here is that the DRAIN honors it —
+// a long cooldown must put the work back on the queue rather than spend the invocation collecting
+// more 429s, and it must do so without burning a dequeue count or taking the lease.
+describe("Helpdesk throttle gate (drain integration)", () => {
+  const LONG_COOLDOWN = { defaultMs: 10_000, maxMs: 300_000 };
+
+  beforeEach(() => {
+    hdMock.onGet("/tickets").reply(200, []);
+    hdMock.onPost("/tickets").reply(200, { ID: "NEW1" });
+    hdMock.onGet("/tickets/NEW1").reply(200, { shortID: "SHORT1" });
+    hdMock.onPatch(/\/tickets\/NEW1/).reply(200, {});
+  });
+
+  afterEach(() => {
+    helpdeskGate.reset();
+    delete process.env.HELPDESK_GATE_ENABLED;
+    delete process.env.HELPDESK_GATE_DEFER_ABOVE_MS;
+    delete process.env.HELPDESK_GATE_SHARED;
+  });
+
+  function gateOn() {
+    process.env.HELPDESK_GATE_ENABLED = "true";
+    // The real pacing budget is 30s of deliberate wall-clock (it is what stops a re-enqueued item
+    // from spinning against an immediately-visible queue message). Shrink it here so the deferral
+    // decision is exercised without the sleep.
+    process.env.HELPDESK_GATE_DEFER_ABOVE_MS = "1";
+    // The cross-instance blob is covered separately; keep this case off the storage boundary.
+    process.env.HELPDESK_GATE_SHARED = "false";
+  }
+
+  it("re-enqueues and returns WITHOUT throwing or locking when a long cooldown is active", async () => {
+    gateOn();
+    helpdeskGate.penalize(120_000, LONG_COOLDOWN);
+    const ctx = fakeContext();
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, ctx);
+
+    // Deferred before the lease: holding it would block every other drain of this mailbox.
+    expect(acquireDrainLock).not.toHaveBeenCalled();
+    // Work put back, no ticket attempted, nothing moved.
+    expect(ctx.extraOutputs.set).toHaveBeenCalledTimes(1);
+    const [, msgs] = (ctx.extraOutputs.set as jest.Mock).mock.calls[0];
+    expect(JSON.parse(msgs[0])).toEqual({ mailbox: MAILBOX, messageId: "M1" });
+    expect(hdMock.history.post).toHaveLength(0);
+    expect(moveMessageToFolder).not.toHaveBeenCalled();
+  });
+
+  it("drains normally when the gate is clear", async () => {
+    gateOn();
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(acquireDrainLock).toHaveBeenCalledTimes(1);
+    expect(hdMock.history.post).toHaveLength(1);
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores an active cooldown when the gate is switched off", async () => {
+    process.env.HELPDESK_GATE_ENABLED = "false";
+    helpdeskGate.penalize(120_000, LONG_COOLDOWN);
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    expect(acquireDrainLock).toHaveBeenCalledTimes(1);
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not consult the gate when ticket creation is off (no Helpdesk calls to gate)", async () => {
+    gateOn();
+    process.env.TICKET_CREATE = "false";
+    helpdeskGate.penalize(120_000, LONG_COOLDOWN);
+
+    await processMail({ mailbox: MAILBOX, messageId: "M1" }, fakeContext());
+
+    // Drain-only work has nothing to do with Helpdesk, so the cooldown must not stall it.
+    expect(acquireDrainLock).toHaveBeenCalledTimes(1);
+    expect(moveMessageToFolder).toHaveBeenCalledTimes(1);
+  });
 });

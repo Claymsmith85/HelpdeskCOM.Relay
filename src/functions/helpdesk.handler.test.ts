@@ -1,8 +1,8 @@
 // Workflow tests for the Helpdesk webhook handler.
 //
 // Locks in the outbound-email decisions:
-//   - tickets.create where the last event is CLIENT-authored (a customer-email-in) patches
-//     customFields but must NOT echo an email back (the inbound worker already handled it).
+//   - tickets.create where the last event is CLIENT-authored (a customer-email-in) must NOT echo
+//     an email back (the inbound worker already handled it).
 //   - tickets.create where the last event is AGENT-authored DOES email the requester.
 //   - tickets.update emails only on agent-authored, non-email, non-system, non-private.
 //
@@ -20,7 +20,6 @@ jest.mock("./graph-mail", () => ({
 }));
 jest.mock("./helpdesk-client", () => ({
   createHelpdeskClient: jest.fn().mockReturnValue({ id: "helpdesk" }),
-  patchCustomFields: jest.fn().mockResolvedValue(undefined),
 }));
 // Keep the real isSystemNoteText (the system-note gate tests depend on it); only the notice
 // orchestration is stubbed — its own behavior is covered by ticket-notices.test.ts.
@@ -40,13 +39,13 @@ jest.mock("./reply-claims", () => ({
 import { helpdesk } from "./helpdesk";
 import { createGraphClientFromEnv } from "./graph-client";
 import { sendMailViaGraph } from "./graph-mail";
-import { patchCustomFields } from "./helpdesk-client";
+import { createHelpdeskClient } from "./helpdesk-client";
 import { sendTicketNotices } from "./ticket-notices";
 import { buildReplyClaimsClient, claimReply, isReplyClaimed } from "./reply-claims";
 
 const graphMock = createGraphClientFromEnv as jest.Mock;
 const sendMock = sendMailViaGraph as jest.Mock;
-const patchMock = patchCustomFields as jest.Mock;
+const helpdeskClientMock = createHelpdeskClient as jest.Mock;
 const noticesMock = sendTicketNotices as jest.Mock;
 const claimClientMock = buildReplyClaimsClient as jest.Mock;
 const isClaimedMock = isReplyClaimed as jest.Mock;
@@ -89,6 +88,11 @@ describe("independent webhook audience toggles", () => {
       subject: "Customer question",
       source: { type: "email", detailedSource: "helpdesk" },
       requester: { email: "john@example.com", name: "John" },
+      // The `email` custom field is RETIRED — the relay neither writes nor reads it, and the
+      // recipient comes from `requester.email` above. It is kept in these fixtures on purpose:
+      // tickets created before the cutover still carry the field in Helpdesk, so real payloads
+      // still include it, and these cases prove the handler ignores whatever it holds (here an
+      // empty string, which under the old gate would have skipped the send entirely).
       customFields: { email: "", inbox: "escape@corespecialty.com" },
       events: [
         { author: { type: "agent" }, source: { type: "api" }, message: { text: "Agent reply", isPrivate: false } },
@@ -104,7 +108,6 @@ describe("independent webhook audience toggles", () => {
 
     expect(request.json).not.toHaveBeenCalled();
     expect(graphMock).not.toHaveBeenCalled();
-    expect(patchMock).not.toHaveBeenCalled();
     expect(sendMock).not.toHaveBeenCalled();
     expect(noticesMock).not.toHaveBeenCalled();
     expect(res.body).toBe("Webhook audiences disabled");
@@ -112,20 +115,15 @@ describe("independent webhook audience toggles", () => {
     expect(res.status).toBe(200);
   });
 
-  it("SUBMITTER_REPLIES only patches and emails the requester without running notices", async () => {
+  it("SUBMITTER_REPLIES only emails the requester without running notices", async () => {
     await helpdesk(fakeRequest(agentCreate), fakeContext());
 
-    expect(patchMock).toHaveBeenCalledWith(
-      expect.anything(),
-      "T1",
-      { email: "john@example.com" }
-    );
     expect(sendMock).toHaveBeenCalledTimes(1);
     expect(sendMock.mock.calls[0][0].to).toBe("john@example.com");
     expect(noticesMock).not.toHaveBeenCalled();
   });
 
-  it("FOLLOWERS_NOTICES only runs that notice audience, patches creates, and sends no requester email", async () => {
+  it("FOLLOWERS_NOTICES only runs that notice audience and sends no requester email", async () => {
     process.env.SUBMITTER_REPLIES = "false";
     process.env.FOLLOWERS_NOTICES = "true";
 
@@ -134,15 +132,10 @@ describe("independent webhook audience toggles", () => {
     expect(noticesMock).toHaveBeenCalledWith(
       expect.objectContaining({ followers: true, agent: false })
     );
-    expect(patchMock).toHaveBeenCalledWith(
-      expect.anything(),
-      "T1",
-      { email: "john@example.com" }
-    );
     expect(sendMock).not.toHaveBeenCalled();
   });
 
-  it("AGENT_NOTICES only runs that notice audience, patches creates, and sends no requester email", async () => {
+  it("AGENT_NOTICES only runs that notice audience and sends no requester email", async () => {
     process.env.SUBMITTER_REPLIES = "false";
     process.env.AGENT_NOTICES = "true";
 
@@ -150,11 +143,6 @@ describe("independent webhook audience toggles", () => {
 
     expect(noticesMock).toHaveBeenCalledWith(
       expect.objectContaining({ followers: false, agent: true })
-    );
-    expect(patchMock).toHaveBeenCalledWith(
-      expect.anything(),
-      "T1",
-      { email: "john@example.com" }
     );
     expect(sendMock).not.toHaveBeenCalled();
   });
@@ -178,12 +166,9 @@ describe("tickets.create from Helpdesk", () => {
     };
   }
 
-  it("patches customFields.email from the requester but does NOT email when client-authored", async () => {
+  it("does NOT email the requester when the create is client-authored", async () => {
     await helpdesk(fakeRequest(createPayload("client")), fakeContext());
 
-    expect(patchMock).toHaveBeenCalledTimes(1);
-    expect(patchMock.mock.calls[0][1]).toBe("T1");
-    expect(patchMock.mock.calls[0][2]).toEqual({ email: "john@example.com" });
 
     expect(sendMock).not.toHaveBeenCalled();
   });
@@ -191,7 +176,6 @@ describe("tickets.create from Helpdesk", () => {
   it("emails the requester when the create's last event is agent-authored", async () => {
     await helpdesk(fakeRequest(createPayload("agent", "Agent reply here")), fakeContext());
 
-    expect(patchMock).toHaveBeenCalledTimes(1);
     expect(sendMock).toHaveBeenCalledTimes(1);
     const arg = sendMock.mock.calls[0][0];
     expect(arg.subject).toBe("Re: Customer question [#ABC]");
@@ -205,11 +189,10 @@ describe("tickets.create from Helpdesk", () => {
     expect(sendMock).not.toHaveBeenCalled();
   });
 
-  it("patches customFields but does not email when the agent create message is private", async () => {
+  it("does not email when the agent create message is private", async () => {
     const payload = createPayload("agent");
     payload.payload.events[0].message.isPrivate = true;
     await helpdesk(fakeRequest(payload), fakeContext());
-    expect(patchMock).toHaveBeenCalledTimes(1);
     expect(sendMock).not.toHaveBeenCalled();
   });
 
@@ -229,7 +212,6 @@ describe("tickets.create from Helpdesk", () => {
     });
     await helpdesk(fakeRequest(payload), fakeContext());
 
-    expect(patchMock).toHaveBeenCalledTimes(1); // customFields patch still runs
     expect(sendMock).not.toHaveBeenCalled();
   });
 
@@ -239,7 +221,6 @@ describe("tickets.create from Helpdesk", () => {
     payload.payload.requester.email = "escape@corespecialty.com";
     await helpdesk(fakeRequest(payload), fakeContext());
 
-    expect(patchMock).toHaveBeenCalledTimes(1); // customFields still patched
     expect(sendMock).not.toHaveBeenCalled(); // but no echo into a drained inbox
   });
 });
@@ -264,7 +245,7 @@ describe("tickets.update", () => {
         shortID: "XYZ",
         subject: "Open topic",
         source: { type: "api", detailedSource: "api" },
-        requester: { email: "jane@example.com", name: "Jane" },
+        requester: { email: customEmail, name: "Jane" },
         customFields: { email: customEmail, inbox: "escapereferrals@corespecialty.com" },
         // Assigned to the Escape Referrals team — the mailbox every send below must come from (a
         // live payload always carries the assignment; the sender follows it, not customFields.inbox).
@@ -289,7 +270,6 @@ describe("tickets.update", () => {
     expect(arg.mailbox).toBe("escapereferrals@corespecialty.com");
     expect(arg.body).toBe("Update reply");
 
-    expect(patchMock).not.toHaveBeenCalled(); // no create branch ran
   });
 
   it("does not email when the last event came from email (already handled inbound)", async () => {
@@ -307,7 +287,7 @@ describe("tickets.update", () => {
     expect(sendMock).not.toHaveBeenCalled();
   });
 
-  it("does not email when there is no requester email in custom fields", async () => {
+  it("does not email when there is no requester email", async () => {
     await helpdesk(fakeRequest(updatePayload({ customEmail: "" })), fakeContext());
     expect(sendMock).not.toHaveBeenCalled();
   });
@@ -411,6 +391,46 @@ describe("tickets.update", () => {
     expect(sendMock.mock.calls[0][0].body).toBe("Fresh agent reply");
   });
 
+  it("emails when a UI reply message is followed by a trailing attachments companion event", async () => {
+    helpdeskClientMock.mockReturnValueOnce({
+      id: "helpdesk",
+      get: jest.fn().mockResolvedValue({ data: Buffer.from("pdf-binary") }),
+    });
+
+    const payload = historyUpdatePayload({
+      ID: 42,
+      date: "2026-08-17T15:00:00.900Z",
+      author: { type: "agent" },
+      source: { type: "helpdesk" },
+      attachments: {
+        files: [{ ID: "f1", name: "endorse-policy.pdf", url: "https://files/1" }],
+        isPrivate: false,
+      },
+    });
+    (payload.payload.events as any[]).splice(1, 0, {
+      ID: 41,
+      date: "2026-08-17T15:00:00.000Z",
+      author: { type: "agent" },
+      source: { type: "helpdesk" },
+      message: {
+        text: "Please see attached.\n---\nAttachments:\n- endorse-policy.pdf",
+        isPrivate: false,
+      },
+    });
+
+    await helpdesk(fakeRequest(payload), fakeContext());
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0][0].to).toBe("jane@example.com");
+    expect(sendMock.mock.calls[0][0].body).toBe("Please see attached.");
+    expect(sendMock.mock.calls[0][0].attachments).toEqual([
+      expect.objectContaining({
+        name: "endorse-policy.pdf",
+        contentType: "application/octet-stream",
+      }),
+    ]);
+  });
+
   it("suppresses the agent reply when the requester is a monitored mailbox (loop guard)", async () => {
     process.env.MAILBOX_ADDRESSES = "escape@corespecialty.com,escapereferrals@corespecialty.com";
     await helpdesk(
@@ -452,8 +472,8 @@ describe("tickets.update", () => {
 });
 
 describe("follower / people-in-the-loop notice pass (FOLLOWERS_NOTICES)", () => {
-  // A client-authored, EMAIL-sourced update with no customFields.email: every requester gate
-  // skips it, which is exactly why the notice pass must run before those gates.
+  // A client-authored, EMAIL-sourced update: every requester gate skips it (not agent-authored,
+  // and already handled inbound), which is exactly why the notice pass must run before those gates.
   function clientUpdate() {
     return {
       eventType: "tickets.update",
@@ -482,7 +502,7 @@ describe("follower / people-in-the-loop notice pass (FOLLOWERS_NOTICES)", () => 
     expect(noticesMock).not.toHaveBeenCalled();
   });
 
-  it("runs on updates the requester gates would skip (client-authored, email-sourced, no customFields.email)", async () => {
+  it("runs on updates the requester gates would skip (client-authored, email-sourced)", async () => {
     process.env.FOLLOWERS_NOTICES = "true";
 
     await helpdesk(fakeRequest(clientUpdate()), fakeContext());
@@ -505,13 +525,11 @@ describe("follower / people-in-the-loop notice pass (FOLLOWERS_NOTICES)", () => 
     await helpdesk(fakeRequest(payload), fakeContext());
 
     expect(noticesMock).toHaveBeenCalledTimes(1);
-    expect(patchMock).toHaveBeenCalledTimes(1);
   });
 
   it("coexists with the requester email on an agent-authored update", async () => {
     process.env.FOLLOWERS_NOTICES = "true";
     const payload = clientUpdate() as any;
-    payload.payload.customFields.email = "jane@example.com";
     payload.payload.events = [
       { author: { type: "agent" }, source: { type: "api" }, message: { text: "Agent reply", isPrivate: false } },
     ];
@@ -538,7 +556,6 @@ describe("follower / people-in-the-loop notice pass (FOLLOWERS_NOTICES)", () => 
     process.env.FOLLOWERS_NOTICES = "true";
     noticesMock.mockRejectedValueOnce(new Error("notices down"));
     const payload = clientUpdate() as any;
-    payload.payload.customFields.email = "jane@example.com";
     payload.payload.events = [
       { author: { type: "agent" }, source: { type: "api" }, message: { text: "Agent reply", isPrivate: false } },
     ];
@@ -702,7 +719,6 @@ describe("same-action companion events (reply that auto-assigns / auto-changes s
     };
     await helpdesk(fakeRequest(payload), fakeContext());
 
-    expect(patchMock).toHaveBeenCalledTimes(1);
     expect(sendMock).toHaveBeenCalledTimes(1);
     expect(sendMock.mock.calls[0][0].to).toBe("john@example.com");
     expect(sendMock.mock.calls[0][0].body).toBe("Reply while unassigned");
@@ -797,7 +813,6 @@ describe("sender mailbox follows the assigned team", () => {
 
     await helpdesk(fakeRequest(payload), fakeContext());
 
-    expect(patchMock).toHaveBeenCalledTimes(1);
     expect(sendMock).toHaveBeenCalledTimes(1);
     expect(sendMock.mock.calls[0][0].mailbox).toBe(MB_REFERRALS);
   });

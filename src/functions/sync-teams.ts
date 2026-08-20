@@ -12,12 +12,13 @@ import { createHelpdeskClient } from "./helpdesk-client";
 import { runTeamSync, teamSyncOptionsFromEnv } from "./team-sync";
 import { createStepLogger } from "./logging";
 import { userMgmtEnabled } from "./env";
+import { helpdeskGate, publishGate, syncGateFromStore, waitOrDefer } from "./helpdesk-gate";
 
 export async function syncTeams(
   _timer: Timer,
   context: InvocationContext
 ): Promise<void> {
-  const { step, stepError } = createStepLogger(context);
+  const { step, stepWarn, stepError } = createStepLogger(context);
   step("Start: AAD security groups -> Helpdesk teams sync");
 
   // Master user-management switch (USERMGMT_TOGGLE). When OFF (the default), attempt no user
@@ -28,12 +29,24 @@ export async function syncTeams(
     return;
   }
 
+  await syncGateFromStore(helpdeskGate, (m, d) => step(m, d));
+  // Global Helpdesk throttle gate. This sync is the heaviest Helpdesk burst in the codebase — one
+  // POST/PATCH/DELETE per agent, unpaced apart from the rate limiter — so it must not start into an
+  // active cooldown. A short one is waited out; a long one abandons the run entirely, which costs
+  // nothing: the sync is a reconcile against live state, so the next tick picks up exactly where
+  // this one would have. Deliberately NOT re-queued (a timer has no queue) and NOT a failure.
+  const stillGatedMs = await waitOrDefer();
+  if (stillGatedMs > 0) {
+    stepWarn("Helpdesk gate: cooldown active; skipping this sync run", { stillGatedMs });
+    return;
+  }
+
   try {
     const opts = teamSyncOptionsFromEnv();
     const log = (...a: any[]) => step(String(a[0]), a[1]);
 
     const graph = await createGraphClientFromEnv(log);
-    const helpdesk = createHelpdeskClient();
+    const helpdesk = createHelpdeskClient({ step, stepWarn, stepError });
 
     const result = await runTeamSync(graph, helpdesk, opts, log);
 
@@ -71,6 +84,9 @@ export async function syncTeams(
   } catch (e) {
     stepError("Team sync failed", e);
     throw e;
+  } finally {
+    // Hand any cooldown this run opened to the other instances (best-effort), on both paths.
+    await publishGate(helpdeskGate, (m, d) => step(m, d));
   }
 }
 

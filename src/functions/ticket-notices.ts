@@ -45,6 +45,10 @@ import {
   type EmailContent,
 } from "./templates";
 import {
+  prepareOutboundAttachments,
+  stripHelpdeskAttachmentBlock,
+} from "./helpdesk-attachments";
+import {
   buildReplyClaimsClient,
   claimReply,
   isReplyClaimed,
@@ -64,8 +68,9 @@ const emailOk = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v);
 // selectEmailableAgentMessage — so the two consumers of "which event is this webhook about"
 // cannot drift apart, the isSystemNoteText precedent)
 
-// A reply that also auto-assigns the ticket (or flips its status) lands its assignment/status
-// companion events AFTER the message inside one action, stamped within moments of each other.
+// A reply that also auto-assigns the ticket (or flips its status, or appends uploaded files in a
+// trailing attachments event) can land those companion events AFTER the message inside one action,
+// stamped within moments of each other.
 // The window bounds how far behind the last event a message may sit and still count as part of
 // the same action; anything older is history and must never be (re)surfaced. Same-action events
 // are stamped by Helpdesk's own clock milliseconds apart, so the window can stay far below any
@@ -74,30 +79,26 @@ export const COMPANION_EVENT_WINDOW_MS = 10_000;
 // Paranoia bound on the trailing metadata walk (a real action appends at most a couple).
 const MAX_COMPANION_SKIP = 5;
 
-/** An assignment/status marker with no visible message — skippable when trailing a reply. */
+/**
+ * A message-less companion marker — assignment/status change or an attachments-only event with
+ * uploaded files — skippable when trailing a same-action reply.
+ */
 function isSkippableMetadataEvent(event: TicketEvent | undefined): boolean {
   if (!event) return false;
   const text = event.message?.text;
   if (typeof text === "string" && text.trim()) return false;
-  return Boolean(event.assignment || event.status);
+  const hasUploadedFiles =
+    Array.isArray(event.attachments?.files) && event.attachments.files.length > 0;
+  return Boolean(event.assignment || event.status || hasUploadedFiles);
 }
 
-/**
- * The event a webhook's ACTION is about: normally the last event; when the last event is a
- * message-less assignment/status marker whose same action also appended a message (a reply that
- * auto-assigned the ticket or auto-changed its status), the message behind the trailing marker
- * run — accepted ONLY when its timestamp is within COMPANION_EVENT_WINDOW_MS of the last event,
- * so an undated or older message never hijacks a standalone reassignment/status change. Every
- * fallback returns the last event unchanged, so callers that classify metadata events keep doing
- * so. Returns null only when there are no events.
- */
-export function selectActionEvent(events: TicketEvents | undefined): TicketEvent | null {
+function selectActionEventIndex(events: TicketEvents | undefined): number {
   const last = events?.at(-1);
-  if (!last) return null;
+  if (!last || !events) return -1;
 
-  if (!isSkippableMetadataEvent(last)) return last;
+  if (!isSkippableMetadataEvent(last)) return events.length - 1;
   const lastDate = Date.parse(String(last.date ?? ""));
-  if (!Number.isFinite(lastDate)) return last;
+  if (!Number.isFinite(lastDate)) return events.length - 1;
 
   let index = events.length - 1;
   let skipped = 0;
@@ -105,15 +106,72 @@ export function selectActionEvent(events: TicketEvents | undefined): TicketEvent
     index -= 1;
     skipped += 1;
   }
-  if (index < 0) return last;
+  if (index < 0) return events.length - 1;
 
   const candidate = events[index];
   const text = candidate?.message?.text;
-  if (typeof text !== "string" || !text.trim()) return last; // nearest real event isn't a message
+  if (typeof text !== "string" || !text.trim()) return events.length - 1;
   const candidateDate = Date.parse(String(candidate.date ?? ""));
-  if (!Number.isFinite(candidateDate)) return last; // undated => cannot prove same-action
-  if (Math.abs(lastDate - candidateDate) > COMPANION_EVENT_WINDOW_MS) return last;
-  return candidate;
+  if (!Number.isFinite(candidateDate)) return events.length - 1;
+  if (Math.abs(lastDate - candidateDate) > COMPANION_EVENT_WINDOW_MS) return events.length - 1;
+  return index;
+}
+
+/**
+ * The event a webhook's ACTION is about: normally the last event; when the last event is a
+ * message-less companion marker (assignment/status/attachments) whose same action also appended a
+ * message, the message behind the trailing marker run — accepted ONLY when its timestamp is
+ * within COMPANION_EVENT_WINDOW_MS of the last event, so an undated or older message never
+ * hijacks a standalone reassignment/status/attachment edit. Every fallback returns the last event
+ * unchanged, so callers that classify metadata events keep doing so. Returns null only when there
+ * are no events.
+ */
+export function selectActionEvent(events: TicketEvents | undefined): TicketEvent | null {
+  if (!events?.length) return null;
+  const index = selectActionEventIndex(events);
+  return index >= 0 ? events[index] : null;
+}
+
+/**
+ * Attachment files carried by the same action as selectActionEvent: files on the selected event
+ * itself plus files on trailing skippable companion events.
+ */
+export function selectActionAttachmentFiles(events: TicketEvents | undefined): Array<{
+  url: string;
+  name: string;
+  size?: number;
+  type?: string;
+}> {
+  if (!events?.length) return [];
+  const selectedIndex = selectActionEventIndex(events);
+  if (selectedIndex < 0) return [];
+
+  const files: Array<{ url: string; name: string; size?: number; type?: string }> = [];
+  const seen = new Set<string>();
+
+  const collect = (event: TicketEvent | undefined) => {
+    for (const file of event?.attachments?.files ?? []) {
+      const url = typeof file?.url === "string" ? file.url : "";
+      const name = typeof file?.name === "string" ? file.name : "attachment";
+      if (!url) continue;
+      const key = `${url}::${name}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      files.push({
+        url,
+        name,
+        size: typeof file?.size === "number" ? file.size : undefined,
+        type: typeof file?.type === "string" ? file.type : undefined,
+      });
+    }
+  };
+
+  collect(events[selectedIndex]);
+  for (let i = selectedIndex + 1; i < events.length; i += 1) {
+    if (!isSkippableMetadataEvent(events[i])) break;
+    collect(events[i]);
+  }
+  return files;
 }
 
 /** The event's ID as a send-once claim key, or null when the payload carries none. */
@@ -467,7 +525,7 @@ export async function sendTicketNotices(opts: {
     // the same-address marker-sender loop guard is applied separately at its send below.
     const excluded = new Set<string>();
     if (followersEnabled) {
-      for (const email of [p.requester?.email, p.customFields?.email, event.authorEmail]) {
+      for (const email of [p.requester?.email, event.authorEmail]) {
         const normalized = (email ?? "").trim().toLowerCase();
         if (normalized) excluded.add(normalized);
       }
@@ -503,6 +561,33 @@ export async function sendTicketNotices(opts: {
       (event.kind === "message" && !event.isPrivate && !event.isSystemNote);
 
     const ref = p.shortID || p.ID;
+    let outboundAttachments: import("./graph-mail").OutboundMailAttachment[] = [];
+    let messageText = event.kind === "message" ? event.text : "";
+    if (event.kind === "message") {
+      const actionFiles = selectActionAttachmentFiles(p.events);
+      if (actionFiles.length) {
+        const prepared = await prepareOutboundAttachments({
+          helpdesk,
+          files: actionFiles,
+          step,
+          stepError,
+          context: "notice",
+        });
+        outboundAttachments = prepared.attachments;
+        if (
+          prepared.totalFiles > 0 &&
+          prepared.attachedFiles === prepared.totalFiles &&
+          prepared.skippedFiles === 0
+        ) {
+          messageText = stripHelpdeskAttachmentBlock(messageText);
+        }
+        step("Notices: attachment prep", {
+          total: prepared.totalFiles,
+          attached: prepared.attachedFiles,
+          skipped: prepared.skippedFiles,
+        });
+      }
+    }
     const content: EmailContent =
       event.kind === "message"
         ? noticeMessageEmail({
@@ -513,7 +598,7 @@ export async function sendTicketNotices(opts: {
               event.authorType === "agent"
                 ? event.authorName || "An agent"
                 : markerSender || p.requester?.name || "The requester",
-            text: event.text,
+            text: messageText,
             isPrivate: event.isPrivate,
             isSystemNote: event.isSystemNote,
           })
@@ -579,6 +664,7 @@ export async function sendTicketNotices(opts: {
           to: r.email,
           subject: content.subject,
           body: content.body,
+          attachments: outboundAttachments,
         });
         followers.sent++;
       } catch (e) {
@@ -611,6 +697,7 @@ export async function sendTicketNotices(opts: {
             to: assignedAgentEmail,
             subject: content.subject,
             body: content.body,
+            attachments: outboundAttachments,
           });
           agent.sent++;
         } catch (e) {

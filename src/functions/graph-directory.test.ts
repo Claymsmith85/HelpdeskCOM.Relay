@@ -16,17 +16,17 @@ describe("listGroupMemberUsers", () => {
   afterEach(() => mock.restore());
 
   it("maps members, prefers mail over UPN, lowercases, and follows @odata.nextLink", async () => {
-    // First page: relative path against the cast endpoint, returns a nextLink (absolute URL).
+    // First page: relative path against transitiveMembers, returns a nextLink.
     mock
-      .onGet(/\/groups\/G1\/transitiveMembers\/microsoft\.graph\.user/)
+      .onGet(/\/groups\/G1\/transitiveMembers\?\$select=id,displayName,mail,userPrincipalName&\$top=999/)
       .reply(200, {
         value: [
           { id: "1", displayName: "Alice", mail: "Alice@Corp.com", accountEnabled: true },
           { id: "2", displayName: "Bob", mail: null, userPrincipalName: "BOB@corp.com" },
         ],
-        "@odata.nextLink": "https://graph.microsoft.com/v1.0/page2",
+        "@odata.nextLink": "/page2",
       });
-    mock.onGet("https://graph.microsoft.com/v1.0/page2").reply(200, {
+    mock.onGet("/page2").reply(200, {
       value: [{ id: "3", displayName: "Cara", mail: "cara@corp.com", accountEnabled: false }],
     });
 

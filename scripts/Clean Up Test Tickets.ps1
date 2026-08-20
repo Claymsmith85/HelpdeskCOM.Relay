@@ -118,7 +118,7 @@ param(
     [ValidateSet('dot', 'bracket')] [string]$CursorStyle = 'dot',
     [ValidateRange(0, [int]::MaxValue)] [int]$MaxDeletions = 0,
     [ValidateRange(1, 100)] [int]$MaxPasses = 10,
-    [ValidateRange(0, 60000)] [int]$ThrottleMs = 200,
+    [ValidateRange(0, 60000)] [int]$ThrottleMs = 1000,
     [string]$OutCsv,
     [switch]$Force
 )

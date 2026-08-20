@@ -298,5 +298,37 @@ describe("sendMailViaGraph", () => {
     expect(body.saveToSentItems).toBe(true);
     mock.restore();
   });
+
+  it("includes fileAttachment payload when outbound attachments are provided", async () => {
+    const graph = axios.create();
+    const mock = new MockAdapter(graph);
+    mock.onPost(/\/users\/.*\/sendMail$/).reply(202);
+
+    await sendMailViaGraph({
+      graph,
+      mailbox: "escape@corespecialty.com",
+      to: "john@example.com",
+      subject: "Re: Need help [#ABC]",
+      body: "See attached.",
+      attachments: [
+        {
+          name: "policy.pdf",
+          contentType: "application/pdf",
+          contentBytes: Buffer.from("hello").toString("base64"),
+        },
+      ],
+    });
+
+    const body = JSON.parse(mock.history.post[0].data);
+    expect(body.message.attachments).toHaveLength(1);
+    expect(body.message.attachments[0]).toEqual(
+      expect.objectContaining({
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        name: "policy.pdf",
+        contentType: "application/pdf",
+      })
+    );
+    mock.restore();
+  });
 });
 

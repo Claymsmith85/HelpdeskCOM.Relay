@@ -136,6 +136,43 @@ export async function blobExists(
   }
 }
 
+/**
+ * Read a blob's body as text, or null when it does not exist.
+ *
+ * Unlike the create-once primitives above this is a plain read of mutable state — the Helpdesk
+ * throttle gate publishes a cooldown deadline that every instance overwrites in turn, so it needs
+ * last-write-wins semantics rather than claim semantics.
+ */
+export async function readBlobText(
+  client: AxiosInstance,
+  container: string,
+  blob: string
+): Promise<string | null> {
+  try {
+    const res = await client.get(blobPath(container, blob), {
+      // Storage returns whatever was written; keep it a string so a numeric body isn't coerced.
+      transformResponse: (body: unknown) => body,
+    });
+    return typeof res.data === "string" ? res.data : String(res.data ?? "");
+  } catch (e) {
+    if (isStorageError(e, 404, "BlobNotFound", "ContainerNotFound")) return null;
+    throw e;
+  }
+}
+
+/** Write (or overwrite) a block blob with the given text body. Last write wins. */
+export async function writeBlobText(
+  client: AxiosInstance,
+  container: string,
+  blob: string,
+  body: string
+): Promise<void> {
+  await ensureContainer(client, container);
+  await client.put(blobPath(container, blob), body, {
+    headers: { "x-ms-blob-type": "BlockBlob", "Content-Type": "application/json" },
+  });
+}
+
 /** Delete a blob if present. A missing blob/container is already the desired state. */
 export async function deleteBlobIfExists(
   client: AxiosInstance,

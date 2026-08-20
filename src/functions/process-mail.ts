@@ -69,6 +69,13 @@ import {
   findTicketByShortId,
   type TicketSummary,
 } from "./helpdesk-client";
+import {
+  gateExceedsDeferBudget,
+  helpdeskGate,
+  publishGate,
+  syncGateFromStore,
+  waitOrDefer,
+} from "./helpdesk-gate";
 import { extractEscapePortalRequester } from "./escape-portal";
 import { extractTicketRef, normalizeRef } from "./subject";
 import { normalizeInbox, normalizeMailboxKey, routeTeam, shouldIgnoreSender, shouldSuppressRecipient } from "./routing";
@@ -194,6 +201,24 @@ export async function processMail(
   if (!drainEnabled && !createTickets) {
     step("Inbound processing disabled (MAILBOX_DRAIN and TICKET_CREATE off)");
     return;
+  }
+
+  // Global Helpdesk throttle gate. Ticketing is this function's only Helpdesk consumer, so a
+  // cooldown only matters while TICKET_CREATE is on. Checked BEFORE the drain lease on purpose:
+  // taking the lease and then sleeping on it would block every other drain of this mailbox for the
+  // whole cooldown. A short cooldown is waited out in place; a long one re-enqueues the item and
+  // returns WITHOUT throwing, so no dequeue count is burned (the acquireDrainLock defer precedent).
+  if (createTickets) {
+    await syncGateFromStore(helpdeskGate, (m, d) => step(m, d));
+    const stillGatedMs = await waitOrDefer();
+    if (stillGatedMs > 0) {
+      context.extraOutputs.set(drainQueueOutput, [JSON.stringify({ mailbox, messageId })]);
+      stepWarn("Helpdesk gate: cooldown active; deferred drain (re-enqueued)", {
+        mailbox,
+        stillGatedMs,
+      });
+      return;
+    }
   }
 
   // Per-mailbox mutual exclusion across instances. On a multi-instance plan two notifications for
@@ -324,12 +349,25 @@ export async function processMail(
       }
     };
 
+    let gateDeferred = false;
+
     const runFolderWork = async (ids: string[], reprocess: boolean): Promise<boolean> => {
       for (const id of ids) {
         // Abort if the lease was lost mid-drain. The queue retry obtains a fresh lease; moved or
         // claimed siblings then skip, so only unfinished work repeats.
         if (lock.lost) {
           throw new Error("process-mail: drain lock lost mid-drain; aborting so the queue retries under a fresh lease");
+        }
+
+        // A 429 partway through the batch opens the global cooldown. Stop at this message boundary
+        // and report work remaining so the existing continuation enqueue puts the rest back —
+        // sitting out a long cooldown would hold the lease and burn the invocation's budget for
+        // messages that would only collect their own 429s. Handled siblings are already moved or
+        // claimed, so the continuation repeats nothing. Gated on createTickets for the same reason
+        // as the pre-lock check: drain-only work makes no Helpdesk request to be throttled.
+        if (createTickets && gateExceedsDeferBudget()) {
+          gateDeferred = true;
+          return true;
         }
 
         const claimName = messageClaimBlobName(lockKey, id);
@@ -385,6 +423,7 @@ export async function processMail(
             createTickets,
             claimClient: client,
             claimName,
+            stepWarn,
           });
         } catch (e) {
           await recordMessageFailure(id, e, "error processing message");
@@ -405,6 +444,14 @@ export async function processMail(
       step("Enqueued continuation drain", { mailbox });
     }
 
+    if (gateDeferred) {
+      stepWarn("Helpdesk gate: cooldown opened mid-drain; stopped early", {
+        mailbox,
+        remainingMs: helpdeskGate.remainingMs(),
+        operations,
+      });
+    }
+
     step("Drain complete", { operations, failures });
 
     // Rethrow so the queue retries the drain (then poison-queues). Successful messages were moved
@@ -413,6 +460,9 @@ export async function processMail(
       throw new Error(`process-mail: ${failures} message(s) failed during inbox drain`);
     }
   } finally {
+    // Publish a cooldown this invocation opened so other instances inherit the pause instead of
+    // rediscovering it. Best-effort and in the finally so a throwing drain still hands it over.
+    await publishGate(helpdeskGate, (m, d) => step(m, d));
     // Release the lease (best-effort) and stop renewing, on both the success and throw paths, so a
     // retried/duplicate drain isn't blocked behind a lease we no longer need.
     await lock.release();
@@ -437,9 +487,12 @@ async function processSingleMessage(
     createTickets: boolean;
     claimClient: AxiosInstance;
     claimName: string;
+    // Named (not positional) so it can't be swapped with `step` — both are StepFn. Feeds the
+    // per-call Helpdesk telemetry, where a retryable 429 is a warning rather than an error.
+    stepWarn: StepFn;
   }
 ): Promise<void> {
-  const { reprocess, drainEnabled, createTickets, claimClient, claimName } = opts;
+  const { reprocess, drainEnabled, createTickets, claimClient, claimName, stepWarn } = opts;
   // Idempotency: a duplicate/overlapping drain for an already-moved message 404s here.
   let msg;
   try {
@@ -511,7 +564,7 @@ async function processSingleMessage(
     return;
   }
 
-  const helpdesk = createHelpdeskClient();
+  const helpdesk = createHelpdeskClient({ step, stepWarn, stepError });
 
   step("Graph: listMessageAttachments begin");
   const attachmentInfos = await listMessageAttachments(
@@ -784,7 +837,9 @@ async function handleNewTicket(opts: {
     // Full email body, entire thread included (no quote/signature stripping); a forged first-line
     // relayed-from marker is neutralized (the notice pass reads markers as attribution).
     messageText: neutralizeForgedMarker(parsed.text),
-    customFields: { email: requesterEmail, inbox: normalizedInbox },
+    // Only `inbox` is stamped. The requester address lives on the ticket's Submitter; the
+    // deprecated `email` custom field was retired once it was deleted in Helpdesk.
+    customFields: { inbox: normalizedInbox },
   });
   step("Helpdesk: createTicket complete", { createdTicketId });
 

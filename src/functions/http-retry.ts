@@ -25,6 +25,11 @@ export type RetryOptions = {
   sleep?: (ms: number) => Promise<void>;
 };
 
+// Defaults for callers that pass no overrides — today the Graph and Storage clients. Kept modest on
+// purpose: one blip should cost a few seconds, not minutes, because the mail drain makes several
+// Graph and Storage calls per message inside a 10-minute functionTimeout. The Helpdesk client wants
+// a deeper ladder and asks for it explicitly (see helpdesk-client.ts), so raising these to suit
+// Helpdesk would slow Graph and Storage for no reason.
 const DEFAULTS = { maxRetries: 3, baseDelayMs: 500, maxDelayMs: 20_000 };
 
 // Statuses where the server rejected the request before processing it -> safe to retry any method.
@@ -101,7 +106,11 @@ function retryDelayMs(
   const retryAfter = parseRetryAfter(error.response?.headers?.["retry-after"]);
   if (retryAfter !== null) return Math.min(retryAfter, maxDelayMs);
   const backoff = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
-  return backoff + Math.floor(Math.random() * baseDelayMs);
+  // Clamp the JITTERED total, not just the exponential term. Adding jitter after the cap let the
+  // real delay reach maxDelayMs + baseDelayMs, so maxDelayMs did not mean what it says — and the
+  // overshoot scaled with baseDelayMs, making the ladder impossible to bound (or to pin in a test)
+  // by lowering maxDelayMs alone.
+  return Math.min(backoff + Math.floor(Math.random() * baseDelayMs), maxDelayMs);
 }
 
 /**

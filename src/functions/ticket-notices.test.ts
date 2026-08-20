@@ -137,6 +137,29 @@ describe("classifyLastEvent", () => {
     ] as any);
     expect(ev).toMatchObject({ kind: "status" });
   });
+
+  it("classifies the preceding message when a same-action attachments event trails it", () => {
+    const ev = classifyLastEvent([
+      {
+        ID: 41,
+        date: "2026-08-17T15:00:00.000Z",
+        author: { type: "agent", ID: "ag9", name: "Sam Agent" },
+        message: { text: "Please see attached.", isPrivate: false },
+      },
+      {
+        ID: 42,
+        date: "2026-08-17T15:00:00.900Z",
+        author: { type: "agent", ID: "ag9", name: "Sam Agent" },
+        attachments: { files: [{ name: "endorse.pdf" }], isPrivate: false },
+      },
+    ] as any);
+
+    expect(ev).toMatchObject({
+      kind: "message",
+      text: "Please see attached.",
+      eventId: "41",
+    });
+  });
 });
 
 // #endregion
@@ -278,11 +301,12 @@ function payload(over: Record<string, any> = {}): any {
 
 function callNotices(
   p: any,
-  audiences: { followers: boolean; agent: boolean } = { followers: true, agent: false }
+  audiences: { followers: boolean; agent: boolean } = { followers: true, agent: false },
+  helpdesk: any = {}
 ) {
   return sendTicketNotices({
     graph: {} as any,
-    helpdesk: {} as any,
+    helpdesk,
     payload: p,
     mailbox: "escape@corespecialty.com",
     ...audiences,
@@ -515,6 +539,52 @@ describe("sendTicketNotices", () => {
     expect(arg.body).toBe("Sam Agent added a reply to ticket AB12:\n\nOn it.");
   });
 
+  it("attaches files directly and strips the boilerplate attachment block when all files were attached", async () => {
+    const helpdesk = {
+      get: jest.fn().mockResolvedValue({ data: Buffer.from("pdf-binary") }),
+    };
+
+    await callNotices(
+      payload({
+        events: [
+          {
+            ID: 41,
+            date: "2026-08-17T15:00:00.000Z",
+            author: { type: "agent", ID: "ag9", name: "Sam Agent" },
+            source: { type: "helpdesk" },
+            message: {
+              text: "Please see attached.\n---\nAttachments:\n- endorse-policy.pdf",
+              isPrivate: false,
+            },
+          },
+          {
+            ID: 42,
+            date: "2026-08-17T15:00:00.900Z",
+            author: { type: "agent", ID: "ag9", name: "Sam Agent" },
+            source: { type: "helpdesk" },
+            attachments: {
+              files: [{ ID: "f1", name: "endorse-policy.pdf", url: "https://files/1" }],
+              isPrivate: false,
+            },
+          },
+        ],
+      }),
+      { followers: true, agent: false },
+      helpdesk
+    );
+
+    expect(sendMock).toHaveBeenCalledTimes(2);
+    expect(sendMock.mock.calls[0][0].body).toBe(
+      "Sam Agent added a reply to ticket AB12:\n\nPlease see attached."
+    );
+    expect(sendMock.mock.calls[0][0].attachments).toEqual([
+      expect.objectContaining({
+        name: "endorse-policy.pdf",
+        contentType: "application/octet-stream",
+      }),
+    ]);
+  });
+
   it("sends private notes and assignment changes to followers ONLY", async () => {
     await callNotices(
       payload({
@@ -708,6 +778,17 @@ describe("same-action companion events and the notice send-once claim", () => {
     },
     ...over,
   });
+  const attachCompanion = (over: any = {}) => ({
+    ID: 43,
+    date: at(900),
+    author: { type: "agent", ID: "ag9", name: "Sam Agent" },
+    source: { type: "helpdesk" },
+    attachments: {
+      files: [{ ID: "f1", name: "endorse-policy.pdf", url: "https://files/1" }],
+      isPrivate: false,
+    },
+    ...over,
+  });
 
   it("classifies the message hiding behind a same-action auto-assignment, with its event ID", () => {
     const ev = classifyLastEvent([agentMsg(), autoAssign()] as any);
@@ -724,6 +805,15 @@ describe("same-action companion events and the notice send-once claim", () => {
     expect(ev).toMatchObject({ kind: "assignment", newAgent: "Sam Agent", eventId: "42" });
   });
 
+  it("classifies the preceding message when a same-action attachment event trails it", () => {
+    const ev = classifyLastEvent([agentMsg(), attachCompanion()] as any);
+    expect(ev).toMatchObject({
+      kind: "message",
+      text: "Reply while unassigned",
+      eventId: "41",
+    });
+  });
+
   it("refuses the companion path when events carry no parseable dates", () => {
     const ev = classifyLastEvent([
       agentMsg({ date: undefined }),
@@ -734,6 +824,19 @@ describe("same-action companion events and the notice send-once claim", () => {
 
   it("notices the reply (not the assignment) to followers when a reply auto-assigns, then claims it", async () => {
     await callNotices(payload({ events: [agentMsg(), autoAssign()] }));
+
+    expect(sendMock.mock.calls.map((c) => c[0].to).sort()).toEqual([FOLLOWER, LOOP]);
+    expect(sendMock.mock.calls[0][0].body).toContain("Reply while unassigned");
+    expect(isClaimedMock).toHaveBeenCalledWith(expect.anything(), "ticket-notice-T1_41");
+    expect(claimReplyMock).toHaveBeenCalledWith(
+      expect.anything(),
+      "ticket-notice-T1_41",
+      expect.stringContaining('"eventId":"41"')
+    );
+  });
+
+  it("notices the reply when a trailing attachment companion follows it, then claims the message", async () => {
+    await callNotices(payload({ events: [agentMsg(), attachCompanion()] }));
 
     expect(sendMock.mock.calls.map((c) => c[0].to).sort()).toEqual([FOLLOWER, LOOP]);
     expect(sendMock.mock.calls[0][0].body).toContain("Reply while unassigned");

@@ -1,10 +1,10 @@
 // src/functions/helpdesk.ts
-// Helpdesk webhook handler. On a UI-authored tickets.create it patches the requester email into
-// customFields and (when enabled, only for agent replies) emails the requester; on tickets.update
+// Helpdesk webhook handler. On a UI-authored tickets.create it emails the requester (when enabled)
+// only for agent replies; on tickets.update
 // it emails the requester only when the webhook's own action carries an agent-authored, non-email,
 // public, non-system-note message. Normally that message IS the last event; the one sanctioned
-// exception is a reply whose action also auto-assigned the ticket or changed its status, which
-// lands trailing assignment/status companion events after the message (see
+// exception is a reply whose action also appends trailing companion metadata (assignment/status,
+// or an attachments event), which can land after the message (see
 // selectEmailableAgentMessage). Standalone non-message events (status/assignment/audience changes)
 // still send nothing, and a per-(ticket, event) claim makes each message event's requester email
 // send-once across webhooks. Independently enabled notice audiences are handled before those
@@ -25,7 +25,7 @@ import { TicketUpdatedPayload } from "../types/TicketUpdatePayload";
 import { createGraphClientFromEnv } from "./graph-client";
 import { sendMailViaGraph } from "./graph-mail";
 import { agentReplyEmail } from "./templates";
-import { createHelpdeskClient, patchCustomFields } from "./helpdesk-client";
+import { createHelpdeskClient } from "./helpdesk-client";
 import { shouldSuppressRecipient } from "./routing";
 import { createStepLogger, type StepErrorFn, type StepFn } from "./logging";
 import {
@@ -39,9 +39,14 @@ import {
 import {
   eventClaimId,
   isSystemNoteText,
+  selectActionAttachmentFiles,
   selectActionEvent,
   sendTicketNotices,
 } from "./ticket-notices";
+import {
+  prepareOutboundAttachments,
+  stripHelpdeskAttachmentBlock,
+} from "./helpdesk-attachments";
 import {
   buildReplyClaimsClient,
   claimReply,
@@ -52,6 +57,7 @@ import {
 // ticket's stamped-once customFields.inbox (which stops matching the responding team the moment the
 // ticket is reassigned). Falls back to that inbox for a team that owns no mailbox.
 import { resolveReplyMailbox } from "./reply-mailbox";
+import { webhookGateMaxWaitMs } from "./helpdesk-gate";
 
 type TicketPayload = TicketUpdatedPayload;
 type TicketEvents = TicketUpdatedPayload["payload"]["events"];
@@ -64,12 +70,11 @@ export async function helpdesk(
   request: HttpRequest,
   context: InvocationContext
 ): Promise<HttpResponseInit> {
-  const { step, stepError } = createStepLogger(context);
+  const { step, stepWarn, stepError } = createStepLogger(context);
 
   // The three webhook-driven audiences are independent. The webhook is dark only when all three
-  // are off; otherwise tickets.create still patches customFields.email so submitter replies work
-  // for tickets created while that audience was disabled. Dev and Prod share one Helpdesk account,
-  // so each webhook toggle must be enabled in at most one environment or recipients are duplicated.
+  // are off. Dev and Prod share one Helpdesk account, so each webhook toggle must be enabled in at
+  // most one environment or recipients are duplicated.
   const submitterOn = submitterRepliesEnabled();
   const agentOn = agentNoticesEnabled();
   const followersOn = followersNoticesEnabled();
@@ -101,10 +106,20 @@ export async function helpdesk(
   });
 
   const graph = await createGraphClientFromEnv();
+  // Deliberately a SHORT gate budget, and no deferral. This handler has nowhere to put the work
+  // back: a slow response makes Helpdesk redeliver the webhook, and the sends here are not
+  // idempotent, so a redelivery duplicates customer and agent email. It therefore cooperates with a
+  // brief cooldown and then dispatches anyway — worst case it collects one 429, which the retry
+  // policy already absorbs. The webhook is 1-3 Helpdesk calls per event; the drain is the volume
+  // the gate exists to hold back.
+  const helpdeskClient = createHelpdeskClient(
+    { step, stepWarn, stepError },
+    { gateMaxWaitMs: webhookGateMaxWaitMs() }
+  );
 
   /**
-   * Assigned-agent and follower / people-in-the-loop notices. Deliberately BEFORE the requester-
-   * specific gates below (email-sourced skip, non-agent skip, missing customFields.email return) —
+  * Assigned-agent and follower / people-in-the-loop notices. Deliberately BEFORE the requester-
+  * specific gates below (email-sourced skip, non-agent skip, missing requester.email return) —
    * notice audiences hear about events the requester does not, so those gates must not starve this
    * pass. Best-effort like the rest of the handler: sendTicketNotices never throws (and is wrapped
    * anyway) because a 500 makes Helpdesk redeliver the webhook and every email would duplicate.
@@ -116,7 +131,7 @@ export async function helpdesk(
     try {
       await sendTicketNotices({
         graph,
-        helpdesk: createHelpdeskClient(),
+          helpdesk: helpdeskClient,
         payload,
         mailbox: replyMailbox.mailbox,
         step,
@@ -130,11 +145,11 @@ export async function helpdesk(
   }
 
   /**
-   * tickets.create (from the Helpdesk UI): patch the requester email into customFields, and email
-   * the requester only when SUBMITTER_REPLIES is on and the create's last event is an agent reply.
-   * Customer-emails-in are client-authored and already handled by the inbound worker, so they are
-   * not echoed back. The patch runs whenever the webhook is not dark, independent of the submitter
-   * toggle, so a ticket created during a notices-only phase is ready when submitter replies turn on.
+   * tickets.create (from the Helpdesk UI): email the requester only when SUBMITTER_REPLIES is on
+   * and the create's last event is an agent reply. Customer-emails-in are client-authored and
+   * already handled by the inbound worker, so they are not echoed back. The address comes from the
+   * ticket's Submitter (`payload.requester.email`) — the deprecated `customFields.email` mirror was
+   * retired once the field was deleted in Helpdesk.
    */
   if (
     payload.eventType === "tickets.create" &&
@@ -144,19 +159,23 @@ export async function helpdesk(
     // Helpdesk retries the webhook, and sendAgentReply runs again — a DUPLICATE email to the
     // requester (the send is not idempotent). Log and move on instead.
     try {
-      const email = (payload.payload.requester.email ?? "").trim();
-      await patchCustomFields(createHelpdeskClient(), payload.payload.ID, { email });
+      const requesterEmail = (payload.payload.requester.email ?? "").trim();
 
       if (!submitterOn) {
-        step("Create: requester email patched; submitter replies disabled");
+        step("Create: submitter replies disabled; skipping requester email");
       } else {
         const selection = selectEmailableAgentMessage(events);
         if (selection) {
+          if (!requesterEmail) {
+            step("Create: requester email missing; skipping requester reply");
+            return { body: "No requester email found, not sending email" };
+          }
           await sendAgentReplyOnce(
             graph,
+            helpdeskClient,
             payload,
             selection,
-            email || payload.payload.customFields.email,
+            requesterEmail,
             replyMailbox.mailbox,
             step,
             stepError
@@ -174,8 +193,8 @@ export async function helpdesk(
 
   /**
    * tickets.update gates: selectEmailableAgentMessage admits only a message the webhook's own
-   * action carries (the last event, or a message immediately behind same-action assignment/status
-   * companions) and requires it to be agent-authored and public — a standalone status change,
+  * action carries (the last event, or a message immediately behind same-action companion
+  * metadata events) and requires it to be agent-authored and public — a standalone status change,
    * reassignment, or other non-message event sends nothing. The email-source skip is applied to
    * the SELECTED event: a customer email-in was already handled by the inbound worker.
    */
@@ -200,16 +219,18 @@ export async function helpdesk(
    * tickets.update agent branch.
    */
   try {
-    if (!payload.payload.customFields.email) {
-      step("Update: no requester email in custom fields; skipping");
-      return { body: "No email found in custom fields, not sending email" };
+    const requesterEmail = (payload.payload.requester?.email ?? "").trim();
+    if (!requesterEmail) {
+      step("Update: no requester email; skipping");
+      return { body: "No requester email found, not sending email" };
     }
 
     await sendAgentReplyOnce(
       graph,
+      helpdeskClient,
       payload,
       selection,
-      payload.payload.customFields.email,
+      requesterEmail,
       replyMailbox.mailbox,
       step,
       stepError
@@ -241,11 +262,11 @@ function visibleAgentMessageText(event: TicketEvent | undefined): string | null 
  * The message to email the requester, or null if nothing may be emailed for this webhook.
  * Shared by the create and update branches, and anchored to the webhook's own ACTION via the
  * shared selectActionEvent (ticket-notices.ts): normally the LAST event; the one sanctioned
- * exception is an agent reply whose action also auto-assigned the ticket (or auto-changed its
- * status), where the message sits behind trailing assignment/status companions and qualifies only
- * within the same-action time window — without that, a reply on an unassigned ticket was silently
- * dropped until the agent assigned themselves and resent. Whatever event is selected must itself
- * be agent-authored AND carry a public, non-system-note, non-blank message.
+ * exception is an agent reply whose action also appends trailing companion metadata
+ * (assignment/status/attachments), where the message sits behind that run and qualifies only
+ * within the same-action time window — without that, a reply with uploaded files can be silently
+ * dropped until a later resend. Whatever event is selected must itself be agent-authored AND
+ * carry a public, non-system-note, non-blank message.
  *
  * There is deliberately still NO general fallback to an older visible message: the payload's
  * events array is the ticket's FULL history, so a fallback turns every agent-authored non-message
@@ -276,6 +297,7 @@ function selectEmailableAgentMessage(events: TicketEvents): EmailableSelection |
  */
 async function sendAgentReplyOnce(
   graph: AxiosInstance,
+  helpdesk: AxiosInstance,
   payload: TicketPayload,
   selection: EmailableSelection,
   toEmail: string,
@@ -307,7 +329,41 @@ async function sendAgentReplyOnce(
     }
   }
 
-  const sent = await sendAgentReply(graph, payload, selection.text, toEmail, mailbox, step);
+  const actionFiles = selectActionAttachmentFiles(payload.payload.events);
+  let outboundAttachments: import("./graph-mail").OutboundMailAttachment[] = [];
+  let bodyText = selection.text;
+  if (actionFiles.length) {
+    const prepared = await prepareOutboundAttachments({
+      helpdesk,
+      files: actionFiles,
+      step,
+      stepError,
+      context: "submitter",
+    });
+    outboundAttachments = prepared.attachments;
+    if (
+      prepared.totalFiles > 0 &&
+      prepared.attachedFiles === prepared.totalFiles &&
+      prepared.skippedFiles === 0
+    ) {
+      bodyText = stripHelpdeskAttachmentBlock(bodyText);
+    }
+    step("Agent reply: attachment prep", {
+      total: prepared.totalFiles,
+      attached: prepared.attachedFiles,
+      skipped: prepared.skippedFiles,
+    });
+  }
+
+  const sent = await sendAgentReply(
+    graph,
+    payload,
+    bodyText,
+    toEmail,
+    mailbox,
+    step,
+    outboundAttachments
+  );
   if (sent) step("Agent reply emailed", { ticketId, eventId, mailbox });
 
   if (sent && claimName) {
@@ -345,7 +401,8 @@ async function sendAgentReply(
   text: string,
   toEmail: string,
   mailbox: string,
-  step: StepFn
+  step: StepFn,
+  attachments: import("./graph-mail").OutboundMailAttachment[] = []
 ): Promise<boolean> {
   if (shouldSuppressRecipient(toEmail)) {
     step("Agent reply skipped: recipient is an in-scope/monitored address (loop guard)", { toEmail });
@@ -362,6 +419,7 @@ async function sendAgentReply(
     to: toEmail,
     subject,
     body,
+    attachments,
   });
   return true;
 }

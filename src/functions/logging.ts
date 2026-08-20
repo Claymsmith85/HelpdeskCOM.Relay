@@ -9,6 +9,17 @@ export type StepFn = (name: string, data?: any) => void;
 export type StepErrorFn = (name: string, err: any, data?: any) => void;
 
 /**
+ * The sinks an API client needs to emit one telemetry entry per call at the right severity.
+ * `createStepLogger` returns exactly this shape, so a handler passes its logger straight through.
+ * Every field is optional: omitted ⇒ that severity is simply not emitted.
+ */
+export type ApiCallLogger = {
+  step?: StepFn;
+  stepWarn?: StepFn;
+  stepError?: StepErrorFn;
+};
+
+/**
  * Safe JSON.stringify wrapper (never throws; falls back to String()).
  */
 export function safeJson(v: any): string {
@@ -52,6 +63,51 @@ export function formatAxiosError(e: any): any {
     method: (ax as any)?.config?.method,
     responseData: formatResponseData(ax?.response?.data),
   };
+}
+
+// Cap the field list so a pathological body can't flood a log line.
+const MAX_SUMMARY_FIELDS = 25;
+
+/**
+ * Describe a request body for logs by SHAPE ONLY — top-level field names and byte size, never
+ * values. Helpdesk request bodies carry customer content (`createTicket` sends the whole inbound
+ * email, `updateTicketMessage` sends reply text), so logging them verbatim would put customer mail
+ * into Application Insights. Field names alone are enough to correlate a 422 with a malformed
+ * payload.
+ *
+ * Accepts either an object or an already-serialized JSON string (axios serializes the body before
+ * the interceptor chain sees it on some paths). Returns undefined for an empty body.
+ */
+export function summarizeRequestBody(
+  data: unknown
+): { bytes: number; fields: string[] } | undefined {
+  if (data === undefined || data === null) return undefined;
+
+  let parsed: unknown = data;
+  let bytes: number;
+
+  if (typeof data === "string") {
+    if (!data) return undefined;
+    bytes = Buffer.byteLength(data, "utf8");
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      // Not JSON (form body, raw text) — report the size without guessing at a shape.
+      return { bytes, fields: [] };
+    }
+  } else {
+    bytes = Buffer.byteLength(safeJson(data), "utf8");
+  }
+
+  if (parsed === null || typeof parsed !== "object") return { bytes, fields: [] };
+  if (Array.isArray(parsed)) return { bytes, fields: [`[${parsed.length} items]`] };
+
+  const keys = Object.keys(parsed as Record<string, unknown>);
+  const fields =
+    keys.length > MAX_SUMMARY_FIELDS
+      ? [...keys.slice(0, MAX_SUMMARY_FIELDS), `…+${keys.length - MAX_SUMMARY_FIELDS} more`]
+      : keys;
+  return { bytes, fields };
 }
 
 /**
